@@ -1,13 +1,19 @@
 [package]
 name = "s3_largecopy"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
 description = "Copy large files (>5GB) between S3 buckets using multipart upload"
 authors = ["Bart LEBOEUF"]
+readme = "README.md"
+homepage = "https://github.com/bartleboeuf/s3_largecopy"
+repository = "https://github.com/bartleboeuf/s3_largecopy"
+rust-version = "1.93.0"  # Specify minimum Rust version
+categories = ["development-tools", "command-line-utilities"]
+keywords = ["s3", "aws", "aws-sdk-s3"]
 
 [dependencies]
-aws-config = { version = "1.0.1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.4.0", features = ["rt-tokio"] }
+aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.122.0", features = ["rt-tokio"] }
 aws-smithy-runtime = { version = "1.2.1", features = ["client", "connector-hyper-0-14-x"] }
 aws-smithy-types = "1.2.1"
 hyper = "0.14"
@@ -22,3 +28,34 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
+
+# Optimize dependencies for release builds
+[profile.release.package."*"]
+opt-level = 3
+debug = false
+
+# Development profile optimizations
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+incremental = true
+
+# Speed up dev builds by reducing optimization on deps
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+# Used only on Windows to build the vcpkg dependencies
+[package.metadata.vcpkg]
+git = "https://github.com/microsoft/vcpkg"
+# The revision of the vcpkg repository to use
+# https://github.com/microsoft/vcpkg/tags
+rev = "2025.12.12"
+
+[package.metadata.vcpkg.target]
+x86_64-pc-windows-msvc = { triplet = "x64-windows-static-md", dev-dependencies = ["openssl"] }
+
+[[bin]]
+name = "s3_largecopy"
+path = "src/main.rs"
