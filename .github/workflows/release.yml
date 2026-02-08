@@ -1,12 +1,13 @@
 name: Release
 
-on:
+'on':
   push:
     tags:
-      - 'v*'
+      - v*
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   create-release:
@@ -77,7 +78,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock')
+            }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
             ${{ runner.os }}-cargo-
@@ -85,7 +87,7 @@ jobs:
       - name: Build binary (Linux, macOS)
         if: matrix.target != 'x86_64-pc-windows-msvc'
         run: cargo build --release --target ${{ matrix.target }}
-        
+
       - name: Build binary (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo build --release --target ${{ matrix.target }}
@@ -109,7 +111,7 @@ jobs:
           echo "BINARY_PATH=${BINARY_PATH}"
           ARCHIVE_NAME="${BINARY_NAME}-${{ github.ref_name }}-${{ matrix.name }}"
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}"
-          
+
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             echo "Creating Windows archive"
             ARCHIVE_FILE="${ARCHIVE_NAME}.zip"
@@ -123,7 +125,7 @@ jobs:
             echo "Creating archive: ${ARCHIVE_FILE}"
             tar -czf "${ARCHIVE_FILE}" -C "target/${{ matrix.target }}/release" "${BINARY_NAME}${{ matrix.ext }}"
           fi
-          
+
           echo "archive_name=${ARCHIVE_FILE}" >> $GITHUB_OUTPUT
           echo "asset_path=${ARCHIVE_FILE}" >> $GITHUB_OUTPUT
 
@@ -138,19 +140,21 @@ jobs:
           asset_content_type: application/octet-stream
 
   generate-checksums:
-    needs: [create-release, build]
+    needs:
+      - create-release
+      - build
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-        
+
       - name: Generate checksums
         run: |
           # Get all release assets
           ASSETS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" \
             | jq -r '.assets[].browser_download_url')
-          
+
           # Download and create checksums
           for asset in $ASSETS; do
             filename=$(basename "$asset")

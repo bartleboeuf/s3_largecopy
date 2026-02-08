@@ -1,6 +1,6 @@
 [package]
 name = "s3_largecopy"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 description = "Copy large files (>5GB) between S3 buckets using multipart upload"
 authors = ["Bart LEBOEUF"]
