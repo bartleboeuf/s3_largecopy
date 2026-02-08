@@ -1,0 +1,24 @@
+[package]
+name = "s3_largecopy"
+version = "0.1.0"
+edition = "2021"
+description = "Copy large files (>5GB) between S3 buckets using multipart upload"
+authors = ["Bart LEBOEUF"]
+
+[dependencies]
+aws-config = { version = "1.0.1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.4.0", features = ["rt-tokio"] }
+aws-smithy-runtime = { version = "1.2.1", features = ["client", "connector-hyper-0-14-x"] }
+aws-smithy-types = "1.2.1"
+hyper = "0.14"
+tokio = { version = "1.20.1", features = ["full"] }
+clap = { version = "4.4.0", features = ["derive"] }
+indicatif = "0.18.3"
+anyhow = "1.0.101"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
