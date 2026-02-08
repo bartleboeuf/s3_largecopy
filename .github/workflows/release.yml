@@ -96,7 +96,7 @@ jobs:
         run: |
           # Extract binary name from Cargo.toml
           # BINARY_NAME=$(grep -E '^name\s*=' Cargo.toml | head -1 | sed -E 's/^name\s*=\s*"(.*)"$/\1/')
-          BINARY_NAME="git-remote-codecommit"
+          BINARY_NAME="s3_largecopy"
           echo "binary_name=${BINARY_NAME}" >> $GITHUB_OUTPUT
 
       - name: Create archive
