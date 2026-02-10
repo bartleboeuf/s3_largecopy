@@ -1,5 +1,8 @@
 # S3 Large File Copy Tool
 
+[![Release](https://github.com/bartleboeuf/s3_largecopy/actions/workflows/release.yml/badge.svg)](https://github.com/bartleboeuf/s3_largecopy/actions/workflows/release.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A Rust application for copying large files (>5GB) between Amazon S3 buckets using multipart upload with progress tracking.
 
 ## Little bit of history ...
@@ -10,16 +13,38 @@ It is satisfying to see that the transfer of a single 100 GB file takes less tha
 
 ## Features
 
+### Core Capabilities
 - **Smart Redundancy Check**: Automatically skips the copy if the destination already contains an identical file (uses Size + Persistent Identity Tracking)
 - **Multipart Upload**: Efficiently copy large files using S3's multipart upload API
 - **Advanced Performance**: High-concurrency engine (up to 1000 parallel parts) with optimized Hyper connection pools
 - **Property Preservation**: Automatically copies standard metadata (`Content-Type`, `Cache-Control`, etc.) and S3 object tags from source to destination.
 - **Auto-Tuning Mode**: Use `--auto` to automatically optimize part size, concurrency, and network settings. Includes an **Instant Copy** path for files < 5GB.
-- **Enterprise Controls**: Support for custom storage classes (`INTELLIGENT_TIERING`, `GLACIER`, etc.) and cross-account `bucket-owner-full-control` ACL.
 - **Adaptive Sizing**: Automatically scales part sizes for multi-terabyte files to stay within S3's 10,000-part limit.
 - **Enhanced Progress**: Real-time dashboard showing throughput (MB/s), ETA, and overall completion.
-- **Error Handling**: Automatic fail-safe cleanup via `abort_multipart_upload` on any transfer error.
-- **Statically Linked**: Optimized for portability with musl-libc (no local GLIBC dependencies).
+
+### Enterprise Controls
+- **Storage Class Support**: Target any S3 storage class (`STANDARD`, `INTELLIGENT_TIERING`, `GLACIER_IR`, `DEEP_ARCHIVE`, etc.)
+- **Cross-Account ACL**: Automatic `bucket-owner-full-control` ACL for cross-account copies (disable with `--no-acl`)
+- **Granular Control Flags**: Selectively disable metadata (`--no-metadata`), tags (`--no-tags`), storage class (`--no-storage-class`), or ACL replication
+
+### Security & Integrity
+- **KMS/Encryption Support**: Server-side encryption with S3-managed keys (`--sse AES256`) or customer-managed KMS keys (`--sse aws:kms --sse-kms-key-id <key>`)
+- **Checksum Validation**: Advanced integrity verification with CRC32, CRC32C, SHA1, or SHA256 checksums (`--checksum-algorithm`)
+- **Dry Run Mode**: Simulate the entire copy operation without modifying any data (`--dry-run`)
+
+### Cost Management
+- **Cost Estimation**: Get detailed cost breakdowns before executing a copy (`--estimate`)
+  - Region-aware pricing for 19+ AWS regions
+  - Accurate API request costs (PUT/COPY/GET class)
+  - Cross-region data transfer calculations
+  - Monthly storage cost projections by storage class
+  - Auto-tuning aware (mirrors actual part-size selection)
+
+### Reliability & Portability
+- **Error Handling**: Automatic fail-safe cleanup via `abort_multipart_upload` on any transfer error
+- **Statically Linked**: Optimized for portability with musl-libc (no local GLIBC dependencies)
+- **Quiet Mode**: Silent operation for cron jobs and automation (`--quiet`)
+
 
 ## Prerequisites
 
@@ -63,7 +88,7 @@ docker run --rm \
 
 ```bash
 chmod +x build_static_docker.sh
-./build_static.sh
+./build_static_docker.sh
 ```
 
 The static binary is located at: `target/x86_64-unknown-linux-musl/release/s3_largecopy`
@@ -112,6 +137,110 @@ file target/x86_64-unknown-linux-musl/release/s3_largecopy
     -r us-west-2
 ```
 
+### Advanced Usage Examples
+
+#### Auto-Tuning Mode
+Let the tool automatically decide the best part size and concurrency based on file size.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k heavy-file.csv \
+    -b dest-bucket -t heavy-file.csv \
+    --auto
+```
+
+#### Changing Storage Class
+Copy data to a cheaper storage class like Intelligent Tiering or Glacier Deep Archive.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k archive.zip \
+    -b dest-bucket -t archive.zip \
+    --storage-class INTELLIGENT_TIERING
+```
+
+#### Cross-Account Copy (ACLs)
+When copying to another account's bucket, you often need to grant them full control.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k shared-data.bin \
+    -b external-account-bucket -t shared-data.bin \
+    --full-control
+```
+
+#### Metadata Control
+Skip copying tags or custom metadata headers.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k raw-data.dat \
+    -b dest-bucket -t raw-data.dat \
+    --no-tags --no-metadata
+```
+
+#### Data Integrity (Checksums)
+Enable additional checksum validation (CRC32, CRC32C, SHA1, or SHA256) during transfer.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k critical-backup.db \
+    -b dest-bucket -t critical-backup.db \
+    --checksum-algorithm SHA256
+```
+
+#### Server-Side Encryption (KMS)
+Encrypt the destination object using a specific KMS key (AWS managed or customer managed).
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k sensitive-data.csv \
+    -b dest-bucket -t sensitive-data.csv \
+    --sse aws:kms \
+    --sse-kms-key-id alias/my-key
+```
+
+#### Dry Run Simulation
+See exactly what will happen without actually moving any data.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k test-file.iso \
+    -b dest-bucket -t test-file.iso \
+    --dry-run
+```
+
+#### Quiet Mode
+Run silently (useful for cron jobs or scripts).
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k daily-log.txt \
+    -b dest-bucket -t daily-log.txt \
+    --quiet
+```
+
+#### Cost Estimation
+Get a detailed cost breakdown before running a copy. Supports cross-region estimation.
+
+```bash
+# Same-region estimate
+./target/release/s3_largecopy \
+    -s source-bucket -k large-dataset.tar.gz \
+    -b dest-bucket -t large-dataset.tar.gz \
+    -r us-east-1 \
+    --estimate
+
+# Cross-region estimate with a different storage class
+./target/release/s3_largecopy \
+    -s source-bucket -k large-dataset.tar.gz \
+    -b dest-bucket -t large-dataset.tar.gz \
+    -r us-east-1 \
+    --dest-region eu-west-1 \
+    --storage-class INTELLIGENT_TIERING \
+    --estimate
+```
+
 ## Command Line Options
 
 | Option | Short | Description | Default |
@@ -128,6 +257,12 @@ file target/x86_64-unknown-linux-musl/release/s3_largecopy
 | `--no-tags` | | Disable replication of S3 object tags | `false` |
 | `--no-storage-class` | | Use destination default storage class | `false` |
 | `--no-acl` | | Disable `bucket-owner-full-control` ACL | `false` |
+| `--dry-run` | | Simulate the copy without modifying data | `false` |
+| `--checksum-algorithm` | | Checksum algorithm (CRC32, CRC32C, SHA1, SHA256) | None |
+| `--sse` | | Server-side encryption algorithm (AES256, aws:kms) | None |
+| `--sse-kms-key-id` | | KMS Key ID (ARN or Alias) for aws:kms | None |
+| `--estimate` | | Print a detailed cost estimate and exit | `false` |
+| `--dest-region` | | Destination region (for cross-region cost estimate) | Same as `--region` |
 | `--quiet` | `-q` | Suppress all informational output | `false` |
 
 ## Architecture
@@ -136,37 +271,75 @@ The following diagram illustrates the application's decision-making process for 
 
 ```mermaid
 graph TD
-    Start[Start S3 Copy] --> FetchMeta[Fetch Source & Dest Metadata]
+    Start[Start S3 Copy] --> EstimateMode{--estimate flag?}
+    
+    EstimateMode -->|Yes| FetchSize[Fetch Source Size]
+    FetchSize --> CalcCost[Calculate API + Transfer + Storage Costs]
+    CalcCost --> PrintEstimate[💰 Print Cost Report]
+    PrintEstimate --> Exit[Exit]
+    
+    EstimateMode -->|No| DryRunCheck{--dry-run flag?}
+    DryRunCheck -->|Yes| SetDryRun[Enable Simulation Mode]
+    DryRunCheck -->|No| SetNormal[Normal Execution Mode]
+    
+    SetDryRun --> FetchMeta[Fetch Source & Dest Metadata]
+    SetNormal --> FetchMeta
+    
     FetchMeta --> IdentityCheck{Data Identities Match?}
     
     IdentityCheck -->|Yes| PropertyCheck{Metadata, Tags, SC Match?}
-    IdentityCheck -->|No| AdaptiveSize[Calculate Adaptive Part Size]
-
+    IdentityCheck -->|No| AutoMode{--auto enabled?}
+    
     PropertyCheck -->|Yes| Skip[⏭️ Skip Copy]
     PropertyCheck -->|No| SizeLimit{Size <= 5GB?}
-
-    SizeLimit -->|Yes| CopyObj[🔄 CopyObject REPLACE]
+    
+    SizeLimit -->|Yes| ApplyEncryption[Apply SSE/KMS Settings]
+    ApplyEncryption --> ApplyChecksum[Apply Checksum Algorithm]
+    ApplyChecksum --> CopyObj[🔄 CopyObject REPLACE]
+    
     SizeLimit -->|No| OnlyTags{Only Tags Diff?}
     
     OnlyTags -->|Yes| PutTags[🔄 PutObjectTagging]
-    OnlyTags -->|No| Multipart[🔄 Multipart Copy]
-
-    AdaptiveSize --> Multipart
-    CopyObj --> Complete[✨ Success]
-    PutTags --> Complete
-    Multipart --> ParallelCopy[📤 Parallel UploadPartCopy]
-    ParallelCopy --> Complete
+    OnlyTags -->|No| MultipartPrep[Prepare Multipart Upload]
+    
+    AutoMode -->|Yes| AutoTune[Auto-tune Part Size & Concurrency]
+    AutoMode -->|No| ManualSize[Use Manual Part Size]
+    
+    AutoTune --> InstantCheck{Size < 5GB?}
+    InstantCheck -->|Yes| ApplyEncryption
+    InstantCheck -->|No| AdaptiveSize[Calculate Adaptive Part Size]
+    
+    ManualSize --> AdaptiveSize
+    AdaptiveSize --> MultipartPrep
+    
+    MultipartPrep --> InitMP[🔐 CreateMultipartUpload with SSE/KMS]
+    InitMP --> ParallelCopy[📤 Parallel UploadPartCopy with Checksums]
+    ParallelCopy --> CompleteMP[✅ CompleteMultipartUpload]
+    
+    CopyObj --> Verify{Dry-run?}
+    PutTags --> Verify
+    CompleteMP --> Verify
+    
+    Verify -->|Yes| SimComplete[📋 Log Simulated Action]
+    Verify -->|No| RealComplete[✨ Execute Action]
+    
+    SimComplete --> Complete[Success]
+    RealComplete --> Complete
+    Skip --> Complete
 ```
+
 
 ## How It Works
 
-1.  **Metadata Discovery**: The tool fetches metadata and tagging for both the source and the destination object.
-2.  **Identity Verification**: It compares the file size and searches for the `x-amz-meta-source-etag` header on the destination. This persistent "Identity Tracking" allows skipping or syncing objects even when S3's own ETag changes.
+1.  **Metadata Discovery**: The tool fetches metadata, tagging, and object attributes (checksums) for both the source and the destination object.
+2.  **Identity Verification**:
+    *   **Fast Check**: Compares file size and the persistent `x-amz-meta-source-etag` header on the destination.
+    *   **Deep Verification**: If `--checksum-algorithm` is used, it validates the source checksum types (CRC32, SHA1, etc.) against the destination to ensure bit-perfect integrity.
 3.  **Intelligent Syncing**:
     *   **Skip**: If data and properties (metadata, tags, storage class) match exactly.
-    *   **Property-Only Sync**: If data matches but properties differ, it updates them WITHOUT re-uploading the data. It uses `CopyObject` (REPLACE) for small files (<5GB) or `PutObjectTagging` for larger ones if only tags changed.
+    *   **Property-Only Sync**: If data matches but properties differ, it updates them WITHOUT re-uploading the data using `CopyObject` (REPLACE) or `PutObjectTagging`.
 4.  **Adaptive Scaling**: For objects > 2.5TB, the tool scales the `part_size` up to stay within S3's 10,000-part limit (supporting up to 50TB).
-5.  **Auto-Tuning Engine**: When `--auto` is enabled, the tool dynamically selects the best part size (128MB to 1GB) and concurrency (up to 100) based on the object size. It also optimizes the internal connection pool and retry strategy.
+5.  **Auto-Tuning Engine**: When `--auto` is enabled, the tool dynamically selects the best part size (128MB to 1GB) and concurrency based on the object size. It prioritizes **Instant Copy** for files < 5GB to avoid multipart overhead.
 6.  **High-Concurrency Engine**: A semaphore-limited async pool executes `UploadPartCopy` operations in parallel using a custom-tuned Hyper HTTP/2 connector.
 7.  **Fail-Safe Cleanup**: Interrupted uploads are automatically aborted via `AbortMultipartUpload` to prevent hidden costs.
 
@@ -198,26 +371,43 @@ The AWS credentials must have the following permissions:
     "Version": "2012-10-17",
     "Statement": [
         {
+            "Sid": "SourceBucketPermissions",
             "Effect": "Allow",
             "Action": [
-                "s3:GetObject"
+                "s3:GetObject",
+                "s3:GetObjectAttributes",
+                "s3:GetObjectTagging"
             ],
             "Resource": "arn:aws:s3:::source-bucket/*"
         },
         {
+            "Sid": "DestBucketPermissions",
             "Effect": "Allow",
             "Action": [
+                "s3:PutObject",
+                "s3:PutObjectTagging",
+                "s3:PutObjectAcl",
                 "s3:CreateMultipartUpload",
                 "s3:UploadPartCopy",
                 "s3:CompleteMultipartUpload",
                 "s3:AbortMultipartUpload",
-                "s3:PutObject"
+                "s3:ListMultipartUploadParts"
             ],
             "Resource": "arn:aws:s3:::dest-bucket/*"
+        },
+        {
+            "Sid": "KMSPermissions",
+            "Effect": "Allow",
+            "Action": [
+                "kms:Decrypt",
+                "kms:GenerateDataKey"
+            ],
+            "Resource": "arn:aws:kms:region:account:key/key-id"
         }
     ]
 }
 ```
+*Note: KMS permissions are only required if using `--sse aws:kms`.*
 
 ## Error Handling
 
@@ -250,11 +440,7 @@ The AWS credentials must have the following permissions:
 
 ## What's next?
 
-Here are some ideas for the next features to implement:
-
-- [ ] Synchronize the full path and not just the objects individually.
-- [ ] Cross-Region optimizations.
-- [ ] Cross-Partition support.
+Here are some ideas I have for the next features to implement are in the [FUTURE_FEATURES.md](FUTURE_FEATURES.md) file.
 
 ## License
 

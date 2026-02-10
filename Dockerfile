@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.85-alpine AS builder
+FROM rust:1.93-alpine AS builder
 
 # Install musl and OpenSSL development headers
 RUN apk add musl-dev openssl-dev

@@ -58,3 +58,6 @@ temp/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Agent
+.agent/
