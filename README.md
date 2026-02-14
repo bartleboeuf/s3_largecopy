@@ -24,7 +24,7 @@ It is satisfying to see that the transfer of a single 100 GB file takes less tha
 
 ### Enterprise Controls
 - **Storage Class Support**: Target any S3 storage class (`STANDARD`, `INTELLIGENT_TIERING`, `GLACIER_IR`, `DEEP_ARCHIVE`, etc.)
-- **Cross-Account ACL**: Automatic `bucket-owner-full-control` ACL for cross-account copies (disable with `--no-acl`)
+- **Cross-Account ACL**: Optional `bucket-owner-full-control` ACL for cross-account copies (`--full-control`, disable with `--no-acl`)
 - **Granular Control Flags**: Selectively disable metadata (`--no-metadata`), tags (`--no-tags`), storage class (`--no-storage-class`), or ACL replication
 
 ### Security & Integrity
@@ -42,6 +42,7 @@ It is satisfying to see that the transfer of a single 100 GB file takes less tha
 
 ### Reliability & Portability
 - **Error Handling**: Automatic fail-safe cleanup via `abort_multipart_upload` on any transfer error
+- **Force Overwrite**: Use `--force-copy` to overwrite destination even when redundancy checks would normally skip copy
 - **Statically Linked**: Optimized for portability with musl-libc (no local GLIBC dependencies)
 - **Quiet Mode**: Silent operation for cron jobs and automation (`--quiet`)
 
@@ -115,7 +116,7 @@ file target/x86_64-unknown-linux-musl/release/s3_largecopy
 ### With Custom Part Size and Concurrency
 
 ```bash
-# Copy with 200MB parts and 5 concurrent uploads
+# Copy with 256MB parts and 50 concurrent uploads
 ./target/release/s3_largecopy \
     -s my-source-bucket \
     -k path/to/large-file.iso \
@@ -147,6 +148,17 @@ Let the tool automatically decide the best part size and concurrency based on fi
     -s source-bucket -k heavy-file.csv \
     -b dest-bucket -t heavy-file.csv \
     --auto
+```
+
+#### Auto-Tuning (Cost-Efficient Profile)
+Prioritize lower multipart API request count with larger parts.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k heavy-file.csv \
+    -b dest-bucket -t heavy-file.csv \
+    --auto \
+    --auto-profile cost-efficient
 ```
 
 #### Changing Storage Class
@@ -210,6 +222,16 @@ See exactly what will happen without actually moving any data.
     --dry-run
 ```
 
+#### Force Overwrite
+Always copy and overwrite destination object, even if destination already matches source.
+
+```bash
+./target/release/s3_largecopy \
+    -s source-bucket -k file.bin \
+    -b dest-bucket -t file.bin \
+    --force-copy
+```
+
 #### Quiet Mode
 Run silently (useful for cron jobs or scripts).
 
@@ -247,17 +269,22 @@ Get a detailed cost breakdown before running a copy. Supports cross-region estim
 |--------|-------|-------------|---------|
 | `--source-bucket` | `-s` | Source S3 bucket name | Required |
 | `--source-key` | `-k` | Source object key | Required |
-| `--dest-bucket` | `-d` | Destination S3 bucket name | Required |
+| `--dest-bucket` | `-b` | Destination S3 bucket name | Required |
 | `--dest-key` | `-t` | Destination object key | Required |
 | `--region` | `-r` | AWS region | Default provider |
 | `--part-size` | `-p` | Part size in MB (5-5120) | 256 |
-| `--concurrency` | `-c` | Number of concurrent uploads (1-1000) | 50 |
+| `--concurrency` |  | Number of concurrent uploads (1-1000) | 50 |
+| `--storage-class` |  | Target storage class (`STANDARD`, `INTELLIGENT_TIERING`, etc.) | Source/default |
+| `--full-control` |  | Apply `bucket-owner-full-control` ACL | `false` |
 | `--auto` | | Enable automatic transfer tuning | `false` |
+| `--auto-profile` | | Auto mode profile (`balanced`, `aggressive`, `conservative`, `cost-efficient`) | `balanced` |
 | `--no-metadata` | | Disable replication of metadata headers | `false` |
 | `--no-tags` | | Disable replication of S3 object tags | `false` |
 | `--no-storage-class` | | Use destination default storage class | `false` |
 | `--no-acl` | | Disable `bucket-owner-full-control` ACL | `false` |
 | `--dry-run` | | Simulate the copy without modifying data | `false` |
+| `--force-copy` | | Always overwrite destination (disable skip/property-only shortcuts) | `false` |
+| `--verify-integrity` | | Verification mode (`off`, `etag`, `checksum`) | `etag` |
 | `--checksum-algorithm` | | Checksum algorithm (CRC32, CRC32C, SHA1, SHA256) | None |
 | `--sse` | | Server-side encryption algorithm (AES256, aws:kms) | None |
 | `--sse-kms-key-id` | | KMS Key ID (ARN or Alias) for aws:kms | None |
@@ -270,78 +297,71 @@ Get a detailed cost breakdown before running a copy. Supports cross-region estim
 The following diagram illustrates the application's decision-making process for optimizing transfers:
 
 ```mermaid
-graph TD
-    Start[Start S3 Copy] --> EstimateMode{--estimate flag?}
-    
-    EstimateMode -->|Yes| FetchSize[Fetch Source Size]
-    FetchSize --> CalcCost[Calculate API + Transfer + Storage Costs]
-    CalcCost --> PrintEstimate[💰 Print Cost Report]
-    PrintEstimate --> Exit[Exit]
-    
-    EstimateMode -->|No| DryRunCheck{--dry-run flag?}
-    DryRunCheck -->|Yes| SetDryRun[Enable Simulation Mode]
-    DryRunCheck -->|No| SetNormal[Normal Execution Mode]
-    
-    SetDryRun --> FetchMeta[Fetch Source & Dest Metadata]
-    SetNormal --> FetchMeta
-    
-    FetchMeta --> IdentityCheck{Data Identities Match?}
-    
-    IdentityCheck -->|Yes| PropertyCheck{Metadata, Tags, SC Match?}
-    IdentityCheck -->|No| AutoMode{--auto enabled?}
-    
-    PropertyCheck -->|Yes| Skip[⏭️ Skip Copy]
-    PropertyCheck -->|No| SizeLimit{Size <= 5GB?}
-    
-    SizeLimit -->|Yes| ApplyEncryption[Apply SSE/KMS Settings]
-    ApplyEncryption --> ApplyChecksum[Apply Checksum Algorithm]
-    ApplyChecksum --> CopyObj[🔄 CopyObject REPLACE]
-    
-    SizeLimit -->|No| OnlyTags{Only Tags Diff?}
-    
-    OnlyTags -->|Yes| PutTags[🔄 PutObjectTagging]
-    OnlyTags -->|No| MultipartPrep[Prepare Multipart Upload]
-    
-    AutoMode -->|Yes| AutoTune[Auto-tune Part Size & Concurrency]
-    AutoMode -->|No| ManualSize[Use Manual Part Size]
-    
-    AutoTune --> InstantCheck{Size < 5GB?}
-    InstantCheck -->|Yes| ApplyEncryption
-    InstantCheck -->|No| AdaptiveSize[Calculate Adaptive Part Size]
-    
-    ManualSize --> AdaptiveSize
-    AdaptiveSize --> MultipartPrep
-    
-    MultipartPrep --> InitMP[🔐 CreateMultipartUpload with SSE/KMS]
-    InitMP --> ParallelCopy[📤 Parallel UploadPartCopy with Checksums]
-    ParallelCopy --> CompleteMP[✅ CompleteMultipartUpload]
-    
-    CopyObj --> Verify{Dry-run?}
-    PutTags --> Verify
-    CompleteMP --> Verify
-    
-    Verify -->|Yes| SimComplete[📋 Log Simulated Action]
-    Verify -->|No| RealComplete[✨ Execute Action]
-    
-    SimComplete --> Complete[Success]
-    RealComplete --> Complete
-    Skip --> Complete
+flowchart TD
+    A[Start] --> B{--estimate?}
+
+    B -- Yes --> C[HeadObject source]
+    C --> D[Estimate strategy and requests]
+    D --> E[Print cost report]
+    E --> Z[Exit]
+
+    B -- No --> F[HeadObject source and destination]
+    F --> G{--force-copy?}
+
+    G -- No --> H{Destination exists and matches data?}
+    H -- Yes --> I{Properties/tags/storage class match?}
+    I -- Yes --> J[Skip copy]
+    I -- No --> K{Small enough for property-only sync?}
+    K -- Yes --> L[CopyObject REPLACE]
+    K -- No --> M{Only tags differ?}
+    M -- Yes --> N[PutObjectTagging]
+    M -- No --> O[Continue to full copy]
+    H -- No --> O
+
+    G -- Yes --> O
+    O --> P{--auto and size < 5 GiB?}
+    P -- Yes --> Q[Instant Copy via CopyObject]
+    P -- No --> R{--auto?}
+
+    R -- No --> S[Manual part size and concurrency cap]
+    R -- Yes --> T[Build auto plan]
+    T --> T1{Auto profile}
+    T1 -- cost-efficient --> U1[Prefer larger parts + lower concurrency]
+    T1 -- balanced/aggressive/conservative --> U2[Balanced speed/reliability/cost tuning]
+    U1 --> U[Apply cost-aware part-size floor]
+    U2 --> U
+    U --> V[Clamp for S3 multipart limits]
+    V --> W[Warm-up probe]
+    W --> X[Retune size from throughput]
+    X --> Y[Re-apply cost floor]
+    Y --> AA[Windowed multipart copy]
+    AA --> AB[Adapt concurrency each window]
+    AB --> AC{More parts?}
+    AC -- Yes --> AA
+    AC -- No --> AD[CompleteMultipartUpload]
+
+    S --> AE[Multipart copy]
+    AE --> AD
+
+    J --> AF[Post-copy verification mode]
+    L --> AF
+    N --> AF
+    Q --> AF
+    AD --> AF
+    AF --> AG[Done]
 ```
 
 
 ## How It Works
 
-1.  **Metadata Discovery**: The tool fetches metadata, tagging, and object attributes (checksums) for both the source and the destination object.
-2.  **Identity Verification**:
-    *   **Fast Check**: Compares file size and the persistent `x-amz-meta-source-etag` header on the destination.
-    *   **Deep Verification**: If `--checksum-algorithm` is used, it validates the source checksum types (CRC32, SHA1, etc.) against the destination to ensure bit-perfect integrity.
-3.  **Intelligent Syncing**:
-    *   **Skip**: If data and properties (metadata, tags, storage class) match exactly.
-    *   **Property-Only Sync**: If data matches but properties differ, it updates them WITHOUT re-uploading the data using `CopyObject` (REPLACE) or `PutObjectTagging`.
-4.  **Adaptive Scaling**: For objects > 2.5TB, the tool scales the `part_size` up to stay within S3's 10,000-part limit (supporting up to 50TB).
-5.  **Auto-Tuning Engine**: When `--auto` is enabled, the tool dynamically selects the best part size (128MB to 1GB) and concurrency based on the object size. It prioritizes **Instant Copy** for files < 5GB to avoid multipart overhead.
-6.  **High-Concurrency Engine**: A semaphore-limited async pool executes `UploadPartCopy` operations in parallel using a custom-tuned Hyper HTTP/2 connector.
-7.  **Fail-Safe Cleanup**: Interrupted uploads are automatically aborted via `AbortMultipartUpload` to prevent hidden costs.
+1.  **Metadata Discovery**: Fetches source metadata first, and destination metadata unless `--force-copy` is enabled.
+2.  **Identity/Property Shortcuts**: If destination data matches source, it can skip copy or run property/tag-only sync instead of full data copy.
+3.  **Force Overwrite Path**: `--force-copy` bypasses shortcut checks and always performs a full overwrite copy.
+4.  **Auto-Tuning Engine**: With `--auto`, the tool can use Instant Copy for files `< 5 GiB`, otherwise it picks profile-based part size/concurrency, region-aware limits, and adaptive sizing.
+5.  **Cost Optimization**: Auto mode applies a cost-aware part-size floor to reduce multipart request count while keeping performance tuning.
+6.  **Probe + Adaptive Loop**: A warm-up probe measures throughput, then multipart copy runs in windows with dynamic concurrency adjustment.
+7.  **Integrity Verification**: Post-copy verification uses `--verify-integrity` (`off`, `etag`, or `checksum`).
+8.  **Fail-Safe Cleanup**: Interrupted multipart uploads are aborted via `AbortMultipartUpload` to prevent hidden costs.
 
 ### Part Size Guidelines
 
@@ -437,6 +457,10 @@ The AWS credentials must have the following permissions:
 - Increase `--concurrency` for parallel uploads
 - Check your network bandwidth to AWS
 
+## Documentation
+
+- [Auto Mode Guide](docs/AUTO_MODE.md)
+- [Cost Analysis](docs/COST_ANALYSIS.md)
 
 ## What's next?
 

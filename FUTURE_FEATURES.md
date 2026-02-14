@@ -17,8 +17,8 @@ Implementation: Simple glob pattern matching on keys before initiating the copy.
 ## Cross-Region optimizations
 Optimizing the transfer between regions is critical for performance.
 
-How it works: Use S3 Transfer Acceleration or S3 Transfer Acceleration for cross-region transfers.
-Why: S3 Transfer Acceleration is a feature that allows you to transfer data to and from S3 at a lower cost and with a faster transfer rate.
+How it works: Use S3 Transfer Acceleration for supported transfer paths.
+Why: S3 Transfer Acceleration can improve transfer speed for long-distance paths, but it adds acceleration charges and should be optional based on cost/performance needs.
 Implementation: Add a --transfer-acceleration flag.
 
 ## Cross-Partition support
@@ -37,3 +37,11 @@ Implementation: Add a progress bar for the overall transfer.
 
 Feature: Use aws pricing api to estimate the cost of the transfer.
 Why: Currently, we can estimate the cost of the transfer using a static values for each region at a point in time.
+Implementation: Review the pricing api in aws documentation and find the correct keys of api call/Storage/data-transfer per region. 
+Add a binary cache locally stored with an expiry at 1 day. If we failed to get pricing, then fallback to static pricing.
+
+## Enhance errors messages
+
+Feature: Show clear error messages and not the exceptions from the API or the rust language.
+Why: Current messages are now really understandable to most of the users.
+Implementation: Make some human readable messages based on error patterns. For some, like SCP errors, give some advice in the message.
