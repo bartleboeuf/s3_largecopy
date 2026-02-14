@@ -1,3 +1,4 @@
+use crate::auto::{AutoProfile, VerifyIntegrity};
 use clap::Parser;
 
 pub const MIN_PART_SIZE_MB: i64 = 5;
@@ -51,6 +52,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub auto: bool,
 
+    /// Auto mode profile (balanced, aggressive, conservative, cost-efficient)
+    #[arg(long, value_enum)]
+    pub auto_profile: Option<AutoProfile>,
+
     /// Disable replication of standard and custom metadata
     #[arg(long, default_value_t = false)]
     pub no_metadata: bool,
@@ -74,6 +79,14 @@ pub struct Args {
     /// Perform a dry run without modifying any data
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// Force full copy and overwrite destination even if object already matches
+    #[arg(long, default_value_t = false)]
+    pub force_copy: bool,
+
+    /// Post-copy integrity verification mode (off, etag, checksum)
+    #[arg(long, value_enum)]
+    pub verify_integrity: Option<VerifyIntegrity>,
 
     /// Checksum algorithm to use (CRC32, CRC32C, SHA1, SHA256)
     #[arg(long, value_parser = ["CRC32", "CRC32C", "SHA1", "SHA256"])]

@@ -1,3 +1,5 @@
+use crate::auto::{AutoProfile, build_auto_plan, clamp_part_size_for_limit, is_instant_copy};
+
 /// Cost estimation module for S3 copy operations.
 ///
 /// Pricing data is based on publicly available AWS S3 pricing as of 2026-02.
@@ -248,50 +250,25 @@ pub fn estimate_cost(
     file_size_bytes: i64,
     part_size_bytes: i64,
     auto: bool,
+    auto_profile: AutoProfile,
     source_region: &str,
     dest_region: Option<&str>,
     storage_class: Option<&str>,
+    no_tags: bool,
 ) -> CostEstimate {
     let dest_region = dest_region.unwrap_or(source_region);
     let storage_class_str = storage_class.unwrap_or("STANDARD");
     let same_region = source_region == dest_region;
 
-    // Calculate effective part size (mirrors auto-tuning logic in app.rs)
-    let effective_part_size = if auto {
-        let hundred_gb: i64 = 100 * 1024 * 1024 * 1024;
-        let one_tb: i64 = 1024 * 1024 * 1024 * 1024;
-        let ten_tb: i64 = 10 * 1024 * 1024 * 1024 * 1024;
-
-        if file_size_bytes < 5 * 1024 * 1024 * 1024 {
-            0 // Instant Copy, no multipart
-        } else if file_size_bytes < hundred_gb {
-            128 * 1024 * 1024
-        } else if file_size_bytes < one_tb {
-            256 * 1024 * 1024
-        } else if file_size_bytes < ten_tb {
-            512 * 1024 * 1024
-        } else {
-            1024 * 1024 * 1024
-        }
-    } else {
-        part_size_bytes
-    };
-
-    // Apply adaptive sizing (S3 10,000 part limit)
-    let effective_part_size = if effective_part_size > 0 {
-        let max_s3_parts: i64 = 10000;
-        if (file_size_bytes + effective_part_size - 1) / effective_part_size > max_s3_parts {
-            (file_size_bytes / 9500 + 1024 * 1024 - 1) / (1024 * 1024) * 1024 * 1024
-        } else {
-            effective_part_size
-        }
-    } else {
+    let is_instant_copy = is_instant_copy(auto, file_size_bytes);
+    let effective_part_size = if is_instant_copy {
         0
+    } else if auto {
+        let auto_plan = build_auto_plan(auto_profile, file_size_bytes, same_region, 64);
+        clamp_part_size_for_limit(file_size_bytes, auto_plan.initial_part_size, 10000)
+    } else {
+        clamp_part_size_for_limit(file_size_bytes, part_size_bytes, 10000)
     };
-
-    // Determine copy strategy
-    let five_gb: i64 = 5 * 1024 * 1024 * 1024;
-    let is_instant_copy = auto && file_size_bytes < five_gb;
 
     // Calculate number of parts
     let num_parts = if is_instant_copy || effective_part_size == 0 {
@@ -317,6 +294,16 @@ pub fn estimate_cost(
     ));
 
     if is_instant_copy {
+        if !no_tags {
+            let tag_requests = 1;
+            let tag_cost = (tag_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
+            api_request_cost += tag_cost;
+            breakdown.push(format!(
+                "  GetObjectTagging        {:>6} req × ${:.4}/1k = ${:.6}",
+                tag_requests, dest_pricing.get_per_1k, tag_cost
+            ));
+        }
+
         // Single CopyObject (PUT-class)
         let copy_cost = 1.0 / 1000.0 * dest_pricing.put_per_1k;
         api_request_cost += copy_cost;
@@ -325,14 +312,16 @@ pub fn estimate_cost(
             1, dest_pricing.put_per_1k, copy_cost
         ));
     } else {
-        // GetObjectTagging on source: GET-class
-        let tag_requests = 1;
-        let tag_cost = (tag_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
-        api_request_cost += tag_cost;
-        breakdown.push(format!(
-            "  GetObjectTagging        {:>6} req × ${:.4}/1k = ${:.6}",
-            tag_requests, dest_pricing.get_per_1k, tag_cost
-        ));
+        if !no_tags {
+            // GetObjectTagging on source: GET-class
+            let tag_requests = 1;
+            let tag_cost = (tag_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
+            api_request_cost += tag_cost;
+            breakdown.push(format!(
+                "  GetObjectTagging        {:>6} req × ${:.4}/1k = ${:.6}",
+                tag_requests, dest_pricing.get_per_1k, tag_cost
+            ));
+        }
 
         // CreateMultipartUpload: 1x PUT-class
         let create_cost = 1.0 / 1000.0 * dest_pricing.put_per_1k;
@@ -519,6 +508,137 @@ pub fn format_estimate(est: &CostEstimate) -> String {
             est.data_transfer_cost
         ));
     }
-
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gib(n: i64) -> i64 {
+        n * 1024 * 1024 * 1024
+    }
+
+    /// Validates that auto mode uses Instant Copy for objects smaller than 5 GiB.
+    #[test]
+    fn auto_small_file_uses_instant_copy_strategy() {
+        let est = estimate_cost(
+            gib(1),
+            256 * 1024 * 1024,
+            true,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("us-east-1"),
+            Some("STANDARD"),
+            false,
+        );
+
+        assert_eq!(est.num_parts, 0);
+        assert_eq!(est.part_size_bytes, 0);
+        assert!(est
+            .breakdown
+            .iter()
+            .any(|line| line.contains("CopyObject (Instant)")));
+    }
+
+    /// Ensures cross-region estimates include non-zero transfer charges.
+    #[test]
+    fn cross_region_copy_has_transfer_cost() {
+        let est = estimate_cost(
+            gib(10),
+            256 * 1024 * 1024,
+            false,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("eu-west-1"),
+            Some("STANDARD"),
+            false,
+        );
+
+        assert!(!est.same_region);
+        assert!(est.data_transfer_cost > 0.0);
+    }
+
+    /// Ensures same-region estimates keep transfer charges at zero.
+    #[test]
+    fn same_region_copy_has_zero_transfer_cost() {
+        let est = estimate_cost(
+            gib(10),
+            256 * 1024 * 1024,
+            false,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("us-east-1"),
+            Some("STANDARD"),
+            false,
+        );
+
+        assert!(est.same_region);
+        assert_eq!(est.data_transfer_cost, 0.0);
+    }
+
+    /// Verifies that disabling tags removes GetObjectTagging request cost from the breakdown.
+    #[test]
+    fn no_tags_removes_get_object_tagging_from_breakdown() {
+        let with_tags = estimate_cost(
+            gib(10),
+            256 * 1024 * 1024,
+            false,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("us-east-1"),
+            Some("STANDARD"),
+            false,
+        );
+        let without_tags = estimate_cost(
+            gib(10),
+            256 * 1024 * 1024,
+            false,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("us-east-1"),
+            Some("STANDARD"),
+            true,
+        );
+
+        assert!(with_tags
+            .breakdown
+            .iter()
+            .any(|line| line.contains("GetObjectTagging")));
+        assert!(!without_tags
+            .breakdown
+            .iter()
+            .any(|line| line.contains("GetObjectTagging")));
+        assert!(without_tags.api_request_cost < with_tags.api_request_cost);
+    }
+
+    /// Confirms the cost-efficient profile favors larger parts and fewer multipart requests.
+    #[test]
+    fn cost_efficient_profile_yields_fewer_parts_than_balanced() {
+        let size = gib(5 * 1024); // 5 TiB
+
+        let balanced = estimate_cost(
+            size,
+            256 * 1024 * 1024,
+            true,
+            AutoProfile::Balanced,
+            "us-east-1",
+            Some("eu-west-1"),
+            Some("STANDARD"),
+            false,
+        );
+        let cost = estimate_cost(
+            size,
+            256 * 1024 * 1024,
+            true,
+            AutoProfile::CostEfficient,
+            "us-east-1",
+            Some("eu-west-1"),
+            Some("STANDARD"),
+            false,
+        );
+
+        assert!(cost.part_size_bytes >= balanced.part_size_bytes);
+        assert!(cost.num_parts <= balanced.num_parts);
+    }
 }

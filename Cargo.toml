@@ -1,6 +1,6 @@
 [package]
 name = "s3_largecopy"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2024"
 description = "Copy large files (>5GB) between S3 buckets using multipart upload"
 authors = ["Bart LEBOEUF"]
@@ -12,12 +12,12 @@ categories = ["development-tools", "command-line-utilities"]
 keywords = ["s3", "aws", "aws-sdk-s3"]
 
 [dependencies]
-aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.122.0", features = ["rt-tokio"] }
-aws-smithy-runtime = { version = "1.2.1", features = ["client", "connector-hyper-0-14-x"] }
-aws-smithy-types = "1.2.1"
-hyper = "0.14"
-tokio = { version = "1.20.1", features = ["full"] }
+aws-config = { version = "1.8.14", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.123.0", features = ["rt-tokio"] }
+aws-smithy-runtime = { version = "1.10.1", features = ["client", "connector-hyper-0-14-x"] }
+aws-smithy-types = "1.4.4"
+hyper = "=0.14.32"
+tokio = { version = "1.49.0", features = ["full"] }
 clap = { version = "4.4.0", features = ["derive"] }
 indicatif = "0.18.3"
 anyhow = "1.0.101"
@@ -45,6 +45,9 @@ incremental = true
 [profile.dev.package."*"]
 opt-level = 1
 debug = false
+
+[dev-dependencies]
+mockall = "0.13"
 
 # Used only on Windows to build the vcpkg dependencies
 [package.metadata.vcpkg]
