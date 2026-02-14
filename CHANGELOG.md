@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.6] - 2026-02-14
+
+### Added
+- **Auto-Tuning Mode**: New `--auto` flag to dynamically select transfer parameters based on object size, region, and profile.
+- **Auto Profiles**: New `--auto-profile` flag to choose from predefined tuning profiles (`balanced`, `aggressive`, `conservative`, `cost-efficient`).
+- **Auto-Tuning Documentation**: New `docs/AUTO_MODE.md` explaining auto-tuning behavior and profiles.
+
+### Changed
+- **Auto-Tuning Implementation**: Added `auto.rs` module for auto-tuning logic.
+
+## [1.0.5] - 2026-02-10
 
 ### Added
 - **Cost Estimation**: New `--estimate` flag to calculate API requests, data transfer, and storage costs before execution. 
@@ -34,8 +44,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Update for github action release workflow.
-
-[Unreleased]: https://github.com/bartleboeuf/s3_largecopy/compare/v1.0.4...HEAD
-[1.0.4]: https://github.com/bartleboeuf/s3_largecopy/compare/v1.0.3...v1.0.4
-[1.0.3]: https://github.com/bartleboeuf/s3_largecopy/compare/v1.0.2...v1.0.3
-[1.0.2]: https://github.com/bartleboeuf/s3_largecopy/compare/774a656...v1.0.2
