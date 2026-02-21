@@ -1,6 +1,6 @@
 [package]
 name = "s3_largecopy"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 description = "Copy large files (>5GB) between S3 buckets using multipart upload"
 authors = ["Bart LEBOEUF"]
@@ -13,14 +13,16 @@ keywords = ["s3", "aws", "aws-sdk-s3"]
 
 [dependencies]
 aws-config = { version = "1.8.14", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.123.0", features = ["rt-tokio"] }
-aws-smithy-runtime = { version = "1.10.1", features = ["client", "connector-hyper-0-14-x"] }
-aws-smithy-types = "1.4.4"
+aws-sdk-s3 = { version = "1.124.0", features = ["rt-tokio"] }
+aws-sdk-pricing = { version = "1.98.0", features = ["rt-tokio"] }
+aws-smithy-runtime = { version = "1.10.2", features = ["client", "connector-hyper-0-14-x"] }
+aws-smithy-types = "1.4.5"
 hyper = "=0.14.32"
-tokio = { version = "1.49.0", features = ["full"] }
-clap = { version = "4.4.0", features = ["derive"] }
-indicatif = "0.18.3"
-anyhow = "1.0.101"
+tokio = { version = "1.49.0", features = ["full", "macros"] }
+clap = { version = "4.5.60", features = ["derive"] }
+indicatif = "0.18.4"
+anyhow = "1.0.102"
+serde_json = "1.0.149"
 
 [profile.release]
 lto = "fat"

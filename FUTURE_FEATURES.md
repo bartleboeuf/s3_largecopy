@@ -33,13 +33,6 @@ Feature: Add a progress bar for the overall transfer.
 Why: It is useful to see the progress of the transfer.
 Implementation: Add a progress bar for the overall transfer.
 
-## Dynamic cost estimation
-
-Feature: Use aws pricing api to estimate the cost of the transfer.
-Why: Currently, we can estimate the cost of the transfer using a static values for each region at a point in time.
-Implementation: Review the pricing api in aws documentation and find the correct keys of api call/Storage/data-transfer per region. 
-Add a binary cache locally stored with an expiry at 1 day. If we failed to get pricing, then fallback to static pricing.
-
 ## Enhance errors messages
 
 Feature: Show clear error messages and not the exceptions from the API or the rust language.
