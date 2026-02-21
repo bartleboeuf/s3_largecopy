@@ -23,6 +23,7 @@ use tokio::task;
 #[derive(Clone)]
 pub struct S3CopyApp {
     client: Client,
+    source_client: Client,
     source_bucket: String,
     source_key: String,
     dest_bucket: String,
@@ -67,6 +68,8 @@ impl S3CopyApp {
         dest_bucket: String,
         dest_key: String,
         region: Option<String>,
+        source_region: Option<String>,
+        profile: Option<String>,
         part_size: i64,
         concurrency: usize,
         storage_class: Option<String>,
@@ -122,18 +125,38 @@ impl S3CopyApp {
             5
         };
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .http_client(http_client)
+            .http_client(http_client.clone())
             .retry_config(RetryConfig::standard().with_max_attempts(max_attempts));
 
         if let Some(r) = region {
             config_loader = config_loader.region(Region::new(r));
         }
 
+        if let Some(p) = profile.clone() {
+            config_loader = config_loader.profile_name(p);
+        }
+
         let config = config_loader.load().await;
         let client = Client::new(&config);
 
+        let mut source_config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(http_client.clone())
+            .retry_config(RetryConfig::standard().with_max_attempts(max_attempts));
+
+        if let Some(r) = source_region {
+            source_config_loader = source_config_loader.region(Region::new(r));
+        }
+
+        if let Some(p) = profile {
+            source_config_loader = source_config_loader.profile_name(p);
+        }
+
+        let source_config = source_config_loader.load().await;
+        let source_client = Client::new(&source_config);
+
         Ok(Self {
             client,
+            source_client,
             source_bucket,
             source_key,
             dest_bucket,
@@ -180,8 +203,12 @@ impl S3CopyApp {
         bucket: &str,
         key: &str,
     ) -> Result<Option<HeadObjectOutput>> {
-        match self
-            .client
+        let client_to_use = if bucket == self.source_bucket {
+            &self.source_client
+        } else {
+            &self.client
+        };
+        match client_to_use
             .head_object()
             .bucket(bucket)
             .key(key)
@@ -225,8 +252,12 @@ impl S3CopyApp {
 
     /// Get object tagging
     async fn get_object_tagging(&self, bucket: &str, key: &str) -> Result<Option<Vec<Tag>>> {
-        match self
-            .client
+        let client_to_use = if bucket == self.source_bucket {
+            &self.source_client
+        } else {
+            &self.client
+        };
+        match client_to_use
             .get_object_tagging()
             .bucket(bucket)
             .key(key)
@@ -1200,7 +1231,7 @@ impl S3CopyApp {
         // Verify the copy
         if !self.dry_run && self.verify_integrity != VerifyIntegrity::Off {
             let source_metadata = self
-                .client
+                .source_client
                 .head_object()
                 .bucket(&self.source_bucket)
                 .key(&self.source_key)
@@ -1280,6 +1311,7 @@ mod tests {
         let client = Client::from_conf(config);
 
         S3CopyApp {
+            source_client: client.clone(),
             client,
             source_bucket: "src-bucket".to_string(),
             source_key: "src-key".to_string(),

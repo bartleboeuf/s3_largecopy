@@ -1,5 +1,6 @@
 use crate::auto::{AutoProfile, build_auto_plan, clamp_part_size_for_limit, is_instant_copy};
 
+
 /// Cost estimation module for S3 copy operations.
 ///
 /// Pricing data is based on publicly available AWS S3 pricing as of 2026-02.
@@ -237,6 +238,67 @@ pub struct CostEstimate {
     pub breakdown: Vec<String>,
 }
 
+/// Orchestrate and run a cost estimate.
+pub async fn run_estimate(
+    args: &crate::args::Args,
+    source_region: &str,
+    dest_region: &str,
+    part_size_mb: i64,
+    concurrency: usize,
+    auto_profile: crate::auto::AutoProfile,
+    verify_integrity: crate::auto::VerifyIntegrity,
+) -> anyhow::Result<()> {
+    // We still need the app to get the source object size
+    let app = crate::app::S3CopyApp::new(
+        args.source_bucket.clone().unwrap(),
+        args.source_key.clone().unwrap(),
+        args.dest_bucket.clone().unwrap(),
+        args.dest_key.clone().unwrap(),
+        args.dest_region.clone().or(args.region.clone()).or_else(|| Some(dest_region.to_string())),
+        Some(source_region.to_string()),
+        args.profile.clone(),
+        part_size_mb * 1024 * 1024,
+        concurrency,
+        args.storage_class.clone(),
+        args.full_control,
+        args.auto,
+        auto_profile,
+        args.no_metadata,
+        args.no_tags,
+        args.no_storage_class,
+        args.no_acl,
+        true, // quiet = true, we only want the estimate output
+        true, // dry_run = true, don't modify anything
+        args.force_copy,
+        verify_integrity,
+        args.checksum_algorithm.clone(),
+        args.sse.clone(),
+        args.sse_kms_key_id.clone(),
+    )
+    .await?;
+
+    // Get the source object size
+    let file_size = app.get_source_size().await?;
+
+    // Attempt to load pricing client for accurate estimates, but fallback to static if it fails
+    let pricing = crate::pricing::S3PricingClient::new(args.profile.as_deref()).await.ok();
+
+    let est = estimate_cost(
+        file_size,
+        part_size_mb * 1024 * 1024,
+        args.auto,
+        auto_profile,
+        source_region,
+        Some(dest_region),
+        args.storage_class.as_deref(),
+        args.no_tags,
+        pricing.as_ref(),
+    ).await;
+
+    println!("{}", format_estimate(&est));
+    Ok(())
+}
+
 /// Estimate the cost of a copy operation.
 ///
 /// # Arguments
@@ -246,7 +308,7 @@ pub struct CostEstimate {
 /// * `source_region` - Source bucket region
 /// * `dest_region` - Destination bucket region (if different)
 /// * `storage_class` - Target storage class (defaults to STANDARD)
-pub fn estimate_cost(
+pub async fn estimate_cost(
     file_size_bytes: i64,
     part_size_bytes: i64,
     auto: bool,
@@ -255,6 +317,7 @@ pub fn estimate_cost(
     dest_region: Option<&str>,
     storage_class: Option<&str>,
     no_tags: bool,
+    pricing_client: Option<&crate::pricing::S3PricingClient>,
 ) -> CostEstimate {
     let dest_region = dest_region.unwrap_or(source_region);
     let storage_class_str = storage_class.unwrap_or("STANDARD");
@@ -277,8 +340,34 @@ pub fn estimate_cost(
         (file_size_bytes + effective_part_size - 1) / effective_part_size
     };
 
-    // Get destination region pricing (costs are billed to the destination)
-    let dest_pricing = get_region_pricing(dest_region);
+    // Get falling back destination region pricing (costs are billed to the destination)
+    let fallback_pricing = get_region_pricing(dest_region);
+
+    let mut put_per_1k = fallback_pricing.put_per_1k;
+    let mut get_per_1k = fallback_pricing.get_per_1k;
+    let mut storage_per_gb = fallback_pricing.storage_per_gb * storage_class_multiplier(storage_class_str);
+    let mut transfer_out_per_gb = fallback_pricing.transfer_out_per_gb;
+
+    if let Some(client) = pricing_client {
+        if let Ok(p) = client.get_class_a_request_price(dest_region, storage_class_str).await {
+            put_per_1k = p * 1000.0;
+        }
+        if let Ok(p) = client.get_class_b_request_price(dest_region, storage_class_str).await {
+            get_per_1k = p * 1000.0;
+        }
+        if let Ok(p) = client.get_storage_price(dest_region, storage_class_str).await {
+            storage_per_gb = p;
+        }
+        if same_region {
+            transfer_out_per_gb = 0.0;
+        } else {
+            if let Ok(p) = client.get_cross_region_transfer_price(source_region, dest_region).await {
+                transfer_out_per_gb = p;
+            } else if let Ok(p) = client.get_data_transfer_price(source_region).await {
+                transfer_out_per_gb = p;
+            }
+        }
+    }
 
     let mut breakdown = Vec::new();
     let mut api_request_cost = 0.0;
@@ -286,73 +375,73 @@ pub fn estimate_cost(
     // --- API Request Costs ---
     // HeadObject on source and destination: 2x GET-class requests
     let head_requests = 2;
-    let head_cost = (head_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
+    let head_cost = (head_requests as f64) / 1000.0 * get_per_1k;
     api_request_cost += head_cost;
     breakdown.push(format!(
         "  HeadObject              {:>6} req × ${:.4}/1k = ${:.6}",
-        head_requests, dest_pricing.get_per_1k, head_cost
+        head_requests, get_per_1k, head_cost
     ));
 
     if is_instant_copy {
         if !no_tags {
             let tag_requests = 1;
-            let tag_cost = (tag_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
+            let tag_cost = (tag_requests as f64) / 1000.0 * get_per_1k;
             api_request_cost += tag_cost;
             breakdown.push(format!(
                 "  GetObjectTagging        {:>6} req × ${:.4}/1k = ${:.6}",
-                tag_requests, dest_pricing.get_per_1k, tag_cost
+                tag_requests, get_per_1k, tag_cost
             ));
         }
 
         // Single CopyObject (PUT-class)
-        let copy_cost = 1.0 / 1000.0 * dest_pricing.put_per_1k;
+        let copy_cost = 1.0 / 1000.0 * put_per_1k;
         api_request_cost += copy_cost;
         breakdown.push(format!(
             "  CopyObject (Instant)    {:>6} req × ${:.4}/1k = ${:.6}",
-            1, dest_pricing.put_per_1k, copy_cost
+            1, put_per_1k, copy_cost
         ));
     } else {
         if !no_tags {
             // GetObjectTagging on source: GET-class
             let tag_requests = 1;
-            let tag_cost = (tag_requests as f64) / 1000.0 * dest_pricing.get_per_1k;
+            let tag_cost = (tag_requests as f64) / 1000.0 * get_per_1k;
             api_request_cost += tag_cost;
             breakdown.push(format!(
                 "  GetObjectTagging        {:>6} req × ${:.4}/1k = ${:.6}",
-                tag_requests, dest_pricing.get_per_1k, tag_cost
+                tag_requests, get_per_1k, tag_cost
             ));
         }
 
         // CreateMultipartUpload: 1x PUT-class
-        let create_cost = 1.0 / 1000.0 * dest_pricing.put_per_1k;
+        let create_cost = 1.0 / 1000.0 * put_per_1k;
         api_request_cost += create_cost;
         breakdown.push(format!(
             "  CreateMultipartUpload   {:>6} req × ${:.4}/1k = ${:.6}",
-            1, dest_pricing.put_per_1k, create_cost
+            1, put_per_1k, create_cost
         ));
 
         // UploadPartCopy: num_parts × PUT-class
-        let parts_cost = (num_parts as f64) / 1000.0 * dest_pricing.put_per_1k;
+        let parts_cost = (num_parts as f64) / 1000.0 * put_per_1k;
         api_request_cost += parts_cost;
         breakdown.push(format!(
             "  UploadPartCopy          {:>6} req × ${:.4}/1k = ${:.6}",
-            num_parts, dest_pricing.put_per_1k, parts_cost
+            num_parts, put_per_1k, parts_cost
         ));
 
         // CompleteMultipartUpload: 1x PUT-class
-        let complete_cost = 1.0 / 1000.0 * dest_pricing.put_per_1k;
+        let complete_cost = 1.0 / 1000.0 * put_per_1k;
         api_request_cost += complete_cost;
         breakdown.push(format!(
             "  CompleteMultipartUpload {:>6} req × ${:.4}/1k = ${:.6}",
-            1, dest_pricing.put_per_1k, complete_cost
+            1, put_per_1k, complete_cost
         ));
 
         // HeadObject verification: 1x GET-class
-        let verify_cost = 1.0 / 1000.0 * dest_pricing.get_per_1k;
+        let verify_cost = 1.0 / 1000.0 * get_per_1k;
         api_request_cost += verify_cost;
         breakdown.push(format!(
             "  HeadObject (verify)     {:>6} req × ${:.4}/1k = ${:.6}",
-            1, dest_pricing.get_per_1k, verify_cost
+            1, get_per_1k, verify_cost
         ));
     }
 
@@ -363,12 +452,11 @@ pub fn estimate_cost(
     let data_transfer_cost = if same_region {
         0.0
     } else {
-        file_size_gb * dest_pricing.transfer_out_per_gb
+        file_size_gb * transfer_out_per_gb
     };
 
     // --- Storage Costs ---
-    let sc_multiplier = storage_class_multiplier(storage_class_str);
-    let monthly_storage_cost = file_size_gb * dest_pricing.storage_per_gb * sc_multiplier;
+    let monthly_storage_cost = file_size_gb * storage_per_gb;
 
     let total_one_time_cost = api_request_cost + data_transfer_cost;
 
@@ -520,8 +608,8 @@ mod tests {
     }
 
     /// Validates that auto mode uses Instant Copy for objects smaller than 5 GiB.
-    #[test]
-    fn auto_small_file_uses_instant_copy_strategy() {
+    #[tokio::test]
+    async fn auto_small_file_uses_instant_copy_strategy() {
         let est = estimate_cost(
             gib(1),
             256 * 1024 * 1024,
@@ -531,7 +619,8 @@ mod tests {
             Some("us-east-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
 
         assert_eq!(est.num_parts, 0);
         assert_eq!(est.part_size_bytes, 0);
@@ -542,8 +631,8 @@ mod tests {
     }
 
     /// Ensures cross-region estimates include non-zero transfer charges.
-    #[test]
-    fn cross_region_copy_has_transfer_cost() {
+    #[tokio::test]
+    async fn cross_region_copy_has_transfer_cost() {
         let est = estimate_cost(
             gib(10),
             256 * 1024 * 1024,
@@ -553,15 +642,16 @@ mod tests {
             Some("eu-west-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
 
         assert!(!est.same_region);
         assert!(est.data_transfer_cost > 0.0);
     }
 
     /// Ensures same-region estimates keep transfer charges at zero.
-    #[test]
-    fn same_region_copy_has_zero_transfer_cost() {
+    #[tokio::test]
+    async fn same_region_copy_has_zero_transfer_cost() {
         let est = estimate_cost(
             gib(10),
             256 * 1024 * 1024,
@@ -571,15 +661,16 @@ mod tests {
             Some("us-east-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
 
         assert!(est.same_region);
         assert_eq!(est.data_transfer_cost, 0.0);
     }
 
     /// Verifies that disabling tags removes GetObjectTagging request cost from the breakdown.
-    #[test]
-    fn no_tags_removes_get_object_tagging_from_breakdown() {
+    #[tokio::test]
+    async fn no_tags_removes_get_object_tagging_from_breakdown() {
         let with_tags = estimate_cost(
             gib(10),
             256 * 1024 * 1024,
@@ -589,7 +680,8 @@ mod tests {
             Some("us-east-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
         let without_tags = estimate_cost(
             gib(10),
             256 * 1024 * 1024,
@@ -599,7 +691,8 @@ mod tests {
             Some("us-east-1"),
             Some("STANDARD"),
             true,
-        );
+            None,
+        ).await;
 
         assert!(with_tags
             .breakdown
@@ -613,8 +706,8 @@ mod tests {
     }
 
     /// Confirms the cost-efficient profile favors larger parts and fewer multipart requests.
-    #[test]
-    fn cost_efficient_profile_yields_fewer_parts_than_balanced() {
+    #[tokio::test]
+    async fn cost_efficient_profile_yields_fewer_parts_than_balanced() {
         let size = gib(5 * 1024); // 5 TiB
 
         let balanced = estimate_cost(
@@ -626,7 +719,8 @@ mod tests {
             Some("eu-west-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
         let cost = estimate_cost(
             size,
             256 * 1024 * 1024,
@@ -636,7 +730,8 @@ mod tests {
             Some("eu-west-1"),
             Some("STANDARD"),
             false,
-        );
+            None,
+        ).await;
 
         assert!(cost.part_size_bytes >= balanced.part_size_bytes);
         assert!(cost.num_parts <= balanced.num_parts);

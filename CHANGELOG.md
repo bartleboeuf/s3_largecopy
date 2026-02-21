@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-02-21
+
+### Added
+- **Live Pricing Tool**: New `--get-price` flag to fetch real-time S3 pricing for any region and storage class.
+- **Dynamic Cost Estimation**: The `--estimate` command now integrates with the **AWS Price List API** to provide real-time cost projections based on current S3 rates.
+- **Architectural Diagram**: Added an "Internal Architecture" Mermaid diagram to `README.md` to visualize module boundaries.
+
+### Changed
+- **Modular Refactoring**: Decoupled `main.rs` into specialized modules: `estimate.rs` (orchestration), `s3_utils.rs` (region detection), and `pricing.rs` (pricing logic).
+- **Service Layer**: Introduced a cleaner service layer architecture for S3 utilities and pricing data.
+
 ## [1.0.6] - 2026-02-14
 
 ### Added

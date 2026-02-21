@@ -14,19 +14,19 @@ pub const MAX_CONCURRENT_PARTS: usize = 1000;
 pub struct Args {
     /// Source S3 bucket name
     #[arg(short, long)]
-    pub source_bucket: String,
+    pub source_bucket: Option<String>,
 
     /// Source object key
     #[arg(short = 'k', long)]
-    pub source_key: String,
+    pub source_key: Option<String>,
 
     /// Destination S3 bucket name
     #[arg(short = 'b', long)]
-    pub dest_bucket: String,
+    pub dest_bucket: Option<String>,
 
     /// Destination object key
     #[arg(short = 't', long)]
-    pub dest_key: String,
+    pub dest_key: Option<String>,
 
     /// AWS region (optional, uses default region if not specified)
     #[arg(short = 'r', long)]
@@ -107,4 +107,12 @@ pub struct Args {
     /// Destination region (for cross-region cost estimation; defaults to --region)
     #[arg(long)]
     pub dest_region: Option<String>,
+
+    /// Get price for a specified storage class and region
+    #[arg(long, default_value_t = false)]
+    pub get_price: bool,
+
+    /// AWS profile to use for credentials
+    #[arg(long)]
+    pub profile: Option<String>,
 }

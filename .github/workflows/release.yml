@@ -10,7 +10,23 @@ permissions:
   packages: write
 
 jobs:
+  # test:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+
+  #     - name: Cache Rust dependencies
+  #       uses: Swatinem/rust-cache@v2
+
+  #     - name: Run tests
+  #       run: cargo test --release
+
   create-release:
+    # needs: test
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
@@ -37,6 +53,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             name: linux-aarch64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-x86_64-static
+            static: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-aarch64-static
+            static: true
+            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             name: macos-x86_64
@@ -59,47 +84,68 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux)
+      - name: Install cross-compilation tools (Linux gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Configure cross-compilation (Linux aarch64)
+      - name: Configure cross-compilation (Linux aarch64 gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      - name: Cache cargo dependencies
-        uses: actions/cache@v3
+      - name: Install musl-tools for x86_64 static builds
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross for ARM static builds
+        if: matrix.use_cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock')
-            }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
-            ${{ runner.os }}-cargo-
+          key: ${{ matrix.target }}
 
       - name: Build binary (Linux, macOS)
-        if: matrix.target != 'x86_64-pc-windows-msvc'
+        if: matrix.target != 'x86_64-pc-windows-msvc' && matrix.static != true
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build binary (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Build x86_64 static binary with cargo
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build ARM static binary with cross
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
       - name: Get binary name
         id: binary_name
         shell: bash
         run: |
-          # Extract binary name from Cargo.toml
-          # BINARY_NAME=$(grep -E '^name\s*=' Cargo.toml | head -1 | sed -E 's/^name\s*=\s*"(.*)"$/\1/')
           BINARY_NAME="s3_largecopy"
           echo "binary_name=${BINARY_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Strip binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: strip target/${{ matrix.target }}/release/${{ steps.binary_name.outputs.binary_name }}
+
+      - name: Verify static binary
+        if: matrix.static == true
+        shell: bash
+        run: file target/${{ matrix.target }}/release/${{ steps.binary_name.outputs.binary_name }}${{ matrix.ext }}
+
+      - name: Show binary info
+        shell: bash
+        run: ls -lh target/${{ matrix.target }}/release/${{ steps.binary_name.outputs.binary_name }}${{ matrix.ext }}
 
       - name: Create archive
         id: archive
@@ -139,35 +185,16 @@ jobs:
           asset_name: ${{ steps.archive.outputs.archive_name }}
           asset_content_type: application/octet-stream
 
-  generate-checksums:
-    needs:
-      - create-release
-      - build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Generate checksum for asset
+        shell: bash
+        run: sha256sum ${{ steps.archive.outputs.archive_name }} >> checksums.txt
 
-      - name: Generate checksums
-        run: |
-          # Get all release assets
-          ASSETS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" \
-            | jq -r '.assets[].browser_download_url')
-
-          # Download and create checksums
-          for asset in $ASSETS; do
-            filename=$(basename "$asset")
-            curl -L -o "$filename" "$asset"
-            sha256sum "$filename" >> checksums.txt
-          done
-
-      - name: Upload checksums
+      - name: Upload checksum
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: checksums.txt
-          asset_name: checksums.txt
+          asset_name: checksums_${{ matrix.name }}.txt
           asset_content_type: text/plain
