@@ -1,5 +1,5 @@
 use crate::auto::{AutoProfile, build_auto_plan, clamp_part_size_for_limit, is_instant_copy};
-
+use s3_pricing::s3_pricing_client::S3PricingClient;
 
 /// Cost estimation module for S3 copy operations.
 ///
@@ -13,7 +13,7 @@ use crate::auto::{AutoProfile, build_auto_plan, clamp_part_size_for_limit, is_in
 /// - Storage: varies by region & storage class
 /// - DELETE and CANCEL requests are free.
 /// - UploadPartCopy is billed as a PUT request on the destination bucket.
-
+///
 /// Regional pricing data for S3 Standard storage class.
 /// Covers the most common AWS regions.
 /// Source: https://aws.amazon.com/s3/pricing/
@@ -248,13 +248,19 @@ pub async fn run_estimate(
     auto_profile: crate::auto::AutoProfile,
     verify_integrity: crate::auto::VerifyIntegrity,
 ) -> anyhow::Result<()> {
-    // We still need the app to get the source object size
+    let source_key = args.source_key.clone().unwrap_or_default();
+    let dest_key = args.dest_key.clone().unwrap_or_default();
+
+    // Create app for getting size info
     let app = crate::app::S3CopyApp::new(
         args.source_bucket.clone().unwrap(),
-        args.source_key.clone().unwrap(),
+        source_key,
         args.dest_bucket.clone().unwrap(),
-        args.dest_key.clone().unwrap(),
-        args.dest_region.clone().or(args.region.clone()).or_else(|| Some(dest_region.to_string())),
+        dest_key,
+        args.dest_region
+            .clone()
+            .or(args.region.clone())
+            .or_else(|| Some(dest_region.to_string())),
         Some(source_region.to_string()),
         args.profile.clone(),
         part_size_mb * 1024 * 1024,
@@ -274,14 +280,23 @@ pub async fn run_estimate(
         args.checksum_algorithm.clone(),
         args.sse.clone(),
         args.sse_kms_key_id.clone(),
+        args.include.clone(),
+        args.exclude.clone(),
     )
     .await?;
 
-    // Get the source object size
-    let file_size = app.get_source_size().await?;
+    // Clone prefix for later use in display
+    let source_prefix_clone = args.source_prefix.clone();
+
+    // Get file size or total size from prefix
+    let file_size = if let Some(ref source_prefix) = args.source_prefix {
+        app.get_total_size_from_prefix(source_prefix).await?
+    } else {
+        app.get_source_size().await?
+    };
 
     // Attempt to load pricing client for accurate estimates, but fallback to static if it fails
-    let pricing = crate::pricing::S3PricingClient::new(args.profile.as_deref()).await.ok();
+    let pricing = S3PricingClient::new(args.profile.as_deref()).await.ok();
 
     let est = estimate_cost(
         file_size,
@@ -293,7 +308,42 @@ pub async fn run_estimate(
         args.storage_class.as_deref(),
         args.no_tags,
         pricing.as_ref(),
-    ).await;
+    )
+    .await;
+
+    // Add object count to output if directory mode
+    if let Some(ref source_prefix) = source_prefix_clone {
+        let dest_prefix_display = args
+            .dest_prefix
+            .clone()
+            .unwrap_or_else(|| args.dest_key.clone().unwrap_or_default());
+        println!("\n=== S3 Directory Copy Estimate ===");
+        println!(
+            "Source prefix: s3://{}/{}",
+            args.source_bucket.clone().unwrap(),
+            source_prefix
+        );
+        println!(
+            "Destination:   s3://{}/{}",
+            args.dest_bucket.clone().unwrap(),
+            dest_prefix_display
+        );
+        println!();
+
+        // Need to get object count for directory mode
+        let object_count = app
+            .list_objects_with_prefix(source_prefix)
+            .await
+            .unwrap_or_default()
+            .len();
+        println!("Objects found: {}", object_count);
+        println!(
+            "Total size:    {} bytes ({:.2} GB)",
+            file_size,
+            file_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        println!();
+    }
 
     println!("{}", format_estimate(&est));
     Ok(())
@@ -308,6 +358,7 @@ pub async fn run_estimate(
 /// * `source_region` - Source bucket region
 /// * `dest_region` - Destination bucket region (if different)
 /// * `storage_class` - Target storage class (defaults to STANDARD)
+#[allow(clippy::too_many_arguments)]
 pub async fn estimate_cost(
     file_size_bytes: i64,
     part_size_bytes: i64,
@@ -317,7 +368,7 @@ pub async fn estimate_cost(
     dest_region: Option<&str>,
     storage_class: Option<&str>,
     no_tags: bool,
-    pricing_client: Option<&crate::pricing::S3PricingClient>,
+    pricing_client: Option<&S3PricingClient>,
 ) -> CostEstimate {
     let dest_region = dest_region.unwrap_or(source_region);
     let storage_class_str = storage_class.unwrap_or("STANDARD");
@@ -345,23 +396,36 @@ pub async fn estimate_cost(
 
     let mut put_per_1k = fallback_pricing.put_per_1k;
     let mut get_per_1k = fallback_pricing.get_per_1k;
-    let mut storage_per_gb = fallback_pricing.storage_per_gb * storage_class_multiplier(storage_class_str);
+    let mut storage_per_gb =
+        fallback_pricing.storage_per_gb * storage_class_multiplier(storage_class_str);
     let mut transfer_out_per_gb = fallback_pricing.transfer_out_per_gb;
 
     if let Some(client) = pricing_client {
-        if let Ok(p) = client.get_class_a_request_price(dest_region, storage_class_str).await {
+        if let Ok(p) = client
+            .get_class_a_request_price(dest_region, storage_class_str)
+            .await
+        {
             put_per_1k = p * 1000.0;
         }
-        if let Ok(p) = client.get_class_b_request_price(dest_region, storage_class_str).await {
+        if let Ok(p) = client
+            .get_class_b_request_price(dest_region, storage_class_str)
+            .await
+        {
             get_per_1k = p * 1000.0;
         }
-        if let Ok(p) = client.get_storage_price(dest_region, storage_class_str).await {
+        if let Ok(p) = client
+            .get_storage_price(dest_region, storage_class_str)
+            .await
+        {
             storage_per_gb = p;
         }
         if same_region {
             transfer_out_per_gb = 0.0;
         } else {
-            if let Ok(p) = client.get_cross_region_transfer_price(source_region, dest_region).await {
+            if let Ok(p) = client
+                .get_cross_region_transfer_price(source_region, dest_region)
+                .await
+            {
                 transfer_out_per_gb = p;
             } else if let Ok(p) = client.get_data_transfer_price(source_region).await {
                 transfer_out_per_gb = p;
@@ -526,13 +590,11 @@ pub fn format_estimate(est: &CostEstimate) -> String {
     output.push_str("│ 1. API Request Charges                                      │\n");
     output.push_str("├──────────────────────────────────────────────────────────────┤\n");
     for line in &est.breakdown {
-        output.push_str(&format!("│ {}│\n", format!("{:<60}", line)));
+        output.push_str(&format!("│ {:<60}│\n", line));
     }
     output.push_str("├──────────────────────────────────────────────────────────────┤\n");
-    output.push_str(&format!(
-        "│ {:>60} │\n",
-        format!("Subtotal: ${:.6}", est.api_request_cost)
-    ));
+    let api_subtotal = format!("Subtotal: ${:.6}", est.api_request_cost);
+    output.push_str(&format!("│ {:>60} │\n", api_subtotal));
     output.push_str("└──────────────────────────────────────────────────────────────┘\n\n");
 
     output.push_str("┌──────────────────────────────────────────────────────────────┐\n");
@@ -550,10 +612,8 @@ pub fn format_estimate(est: &CostEstimate) -> String {
         );
         output.push_str(&format!("│ {:<60}│\n", line));
         output.push_str("│   (UploadPartCopy = inter-region data transfer)             │\n");
-        output.push_str(&format!(
-            "│ {:>60} │\n",
-            format!("Subtotal: ${:.4}", est.data_transfer_cost)
-        ));
+        let transfer_subtotal = format!("Subtotal: ${:.4}", est.data_transfer_cost);
+        output.push_str(&format!("│ {:>60} │\n", transfer_subtotal));
     }
     output.push_str("└──────────────────────────────────────────────────────────────┘\n\n");
 
@@ -620,14 +680,16 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
 
         assert_eq!(est.num_parts, 0);
         assert_eq!(est.part_size_bytes, 0);
-        assert!(est
-            .breakdown
-            .iter()
-            .any(|line| line.contains("CopyObject (Instant)")));
+        assert!(
+            est.breakdown
+                .iter()
+                .any(|line| line.contains("CopyObject (Instant)"))
+        );
     }
 
     /// Ensures cross-region estimates include non-zero transfer charges.
@@ -643,7 +705,8 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
 
         assert!(!est.same_region);
         assert!(est.data_transfer_cost > 0.0);
@@ -662,7 +725,8 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
 
         assert!(est.same_region);
         assert_eq!(est.data_transfer_cost, 0.0);
@@ -681,7 +745,8 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
         let without_tags = estimate_cost(
             gib(10),
             256 * 1024 * 1024,
@@ -692,16 +757,21 @@ mod tests {
             Some("STANDARD"),
             true,
             None,
-        ).await;
+        )
+        .await;
 
-        assert!(with_tags
-            .breakdown
-            .iter()
-            .any(|line| line.contains("GetObjectTagging")));
-        assert!(!without_tags
-            .breakdown
-            .iter()
-            .any(|line| line.contains("GetObjectTagging")));
+        assert!(
+            with_tags
+                .breakdown
+                .iter()
+                .any(|line| line.contains("GetObjectTagging"))
+        );
+        assert!(
+            !without_tags
+                .breakdown
+                .iter()
+                .any(|line| line.contains("GetObjectTagging"))
+        );
         assert!(without_tags.api_request_cost < with_tags.api_request_cost);
     }
 
@@ -720,7 +790,8 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
         let cost = estimate_cost(
             size,
             256 * 1024 * 1024,
@@ -731,7 +802,8 @@ mod tests {
             Some("STANDARD"),
             false,
             None,
-        ).await;
+        )
+        .await;
 
         assert!(cost.part_size_bytes >= balanced.part_size_bytes);
         assert!(cost.num_parts <= balanced.num_parts);

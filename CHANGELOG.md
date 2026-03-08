@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-03-08
+
+### Added
+- **Recursive Prefix Copy**: New directory mode via `--source-prefix` and `--dest-prefix` to copy entire S3 prefixes.
+- **Include/Exclude Filters**: New `--include` / `--exclude` glob patterns to filter which keys are copied in prefix mode.
+- **Prefix-Aware Estimation**: `--estimate` now supports prefix mode (total size + object count) before running a copy.
+
+### Changed
+- **Pricing Implementation**: Replaced the internal pricing module with my new external `s3-pricing` crate (still uses the AWS Price List API).
+- **Docs Refresh**: Updated `docs/` and `README.md` to document live pricing behavior and fallback estimation when Pricing API access is unavailable.
+- **Dependencies**: Updated AWS SDK and other crate versions.
+
+### Removed
+- **Internal Pricing Module**: Deleted `src/pricing.rs` in favor of my new dedicated `s3-pricing` crate.
+
 ## [1.0.7] - 2026-02-21
 
 ### Added

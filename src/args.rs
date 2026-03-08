@@ -20,6 +20,10 @@ pub struct Args {
     #[arg(short = 'k', long)]
     pub source_key: Option<String>,
 
+    /// Source object prefix (directory path to sync from)
+    #[arg(long)]
+    pub source_prefix: Option<String>,
+
     /// Destination S3 bucket name
     #[arg(short = 'b', long)]
     pub dest_bucket: Option<String>,
@@ -27,6 +31,10 @@ pub struct Args {
     /// Destination object key
     #[arg(short = 't', long)]
     pub dest_key: Option<String>,
+
+    /// Destination prefix (directory path to sync into)
+    #[arg(long)]
+    pub dest_prefix: Option<String>,
 
     /// AWS region (optional, uses default region if not specified)
     #[arg(short = 'r', long)]
@@ -111,6 +119,14 @@ pub struct Args {
     /// Get price for a specified storage class and region
     #[arg(long, default_value_t = false)]
     pub get_price: bool,
+
+    /// Include only keys that match these glob patterns (comma separated or repeat flag)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub include: Vec<String>,
+
+    /// Exclude keys that match these glob patterns (comma separated or repeat flag)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub exclude: Vec<String>,
 
     /// AWS profile to use for credentials
     #[arg(long)]
