@@ -26,3 +26,7 @@ This document covers common issues and tips for getting the best performance.
 ### Slow Transfers
 - **Cause**: Network throttling or local CPU bottlenecks.
 - **Fix**: Check your instance's network throughput limits. Use `--auto` to let the tool find the optimal settings for your specific hardware.
+
+### Pricing API Errors
+- **Cause**: Missing `pricing:GetProducts`, expired AWS credentials, or no network path to the AWS Pricing API.
+- **Fix**: Verify credentials and permissions if you are using `--get-price`. For `--estimate`, the command can still complete with the built-in regional pricing fallback, so the output is approximate rather than live.

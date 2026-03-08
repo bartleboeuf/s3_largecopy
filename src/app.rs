@@ -13,9 +13,10 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client, config::Region};
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
 use aws_smithy_types::retry::RetryConfig;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task;
 
@@ -45,6 +46,131 @@ pub struct S3CopyApp {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub sse: Option<ServerSideEncryption>,
     pub sse_kms_key_id: Option<String>,
+    filters: Option<KeyFilter>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: i64,
+}
+
+#[derive(Clone)]
+struct KeyFilter {
+    include: Option<GlobSet>,
+    exclude: Option<GlobSet>,
+}
+
+impl KeyFilter {
+    fn from_patterns(include: Vec<String>, exclude: Vec<String>) -> Result<Option<Self>> {
+        if include.is_empty() && exclude.is_empty() {
+            return Ok(None);
+        }
+        let include = build_globset(&include)?;
+        let exclude = build_globset(&exclude)?;
+        Ok(Some(Self { include, exclude }))
+    }
+
+    fn matches(&self, key: &str) -> bool {
+        if let Some(ex) = &self.exclude
+            && ex.is_match(key)
+        {
+            return false;
+        }
+        if let Some(inc) = &self.include {
+            return inc.is_match(key);
+        }
+        true
+    }
+}
+
+fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        builder.add(Glob::new(pat).with_context(|| format!("Invalid glob pattern '{}'", pat))?);
+    }
+    let set = builder.build().context("Failed to build glob matcher")?;
+    Ok(Some(set))
+}
+
+fn normalize_prefix(prefix: &str) -> String {
+    if prefix.is_empty() {
+        String::new()
+    } else if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{}/", prefix)
+    }
+}
+
+fn dest_key_from_prefix(normalized_source: &str, normalized_dest: &str, key: &str) -> String {
+    let relative = key.strip_prefix(normalized_source).unwrap_or(key);
+    format!("{}{}", normalized_dest, relative)
+}
+
+fn is_retryable_prefix_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("slowdown")
+        || msg.contains("throttl")
+        || msg.contains("too many requests")
+        || msg.contains("requestlimitexceeded")
+        || msg.contains("503")
+}
+
+fn retry_backoff_delay(attempt: usize, total_objects: usize) -> Duration {
+    let base_ms: u64 = if total_objects >= 10_000 {
+        300
+    } else if total_objects >= 2_000 {
+        200
+    } else {
+        125
+    };
+    let exp = (attempt.saturating_sub(1)).min(6) as u32;
+    let delay_ms = base_ms.saturating_mul(1u64 << exp).min(15_000);
+    Duration::from_millis(delay_ms)
+}
+
+fn object_pace_delay(total_objects: usize) -> Duration {
+    let delay_ms: u64 = if total_objects >= 50_000 {
+        60
+    } else if total_objects >= 10_000 {
+        30
+    } else if total_objects >= 2_000 {
+        10
+    } else {
+        0
+    };
+    Duration::from_millis(delay_ms)
+}
+
+fn progress_report_interval(total_objects: usize) -> usize {
+    if total_objects <= 200 {
+        1
+    } else if total_objects <= 2_000 {
+        25
+    } else {
+        100
+    }
+}
+
+fn eta_from_progress(
+    elapsed: Duration,
+    processed_bytes: i64,
+    total_bytes: i64,
+) -> Option<Duration> {
+    if processed_bytes <= 0 || total_bytes <= processed_bytes {
+        return None;
+    }
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let bytes_per_sec = processed_bytes as f64 / elapsed_secs;
+    if bytes_per_sec <= 0.0 {
+        return None;
+    }
+    let remaining_secs = ((total_bytes - processed_bytes) as f64 / bytes_per_sec).max(0.0);
+    Some(Duration::from_secs_f64(remaining_secs))
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -62,6 +188,7 @@ impl ChecksumProvider for HeadObjectChecksumProvider {
 
 impl S3CopyApp {
     /// Create a new S3CopyApp instance
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         source_bucket: String,
         source_key: String,
@@ -87,6 +214,8 @@ impl S3CopyApp {
         checksum_algorithm: Option<String>,
         sse: Option<String>,
         sse_kms_key_id: Option<String>,
+        include_patterns: Vec<String>,
+        exclude_patterns: Vec<String>,
     ) -> Result<Self> {
         // Convert storage class string to StorageClass enum
         let storage_class = storage_class.map(|s| StorageClass::from(s.as_str()));
@@ -153,6 +282,7 @@ impl S3CopyApp {
 
         let source_config = source_config_loader.load().await;
         let source_client = Client::new(&source_config);
+        let filters = KeyFilter::from_patterns(include_patterns, exclude_patterns)?;
 
         Ok(Self {
             client,
@@ -178,7 +308,16 @@ impl S3CopyApp {
             checksum_algorithm,
             sse,
             sse_kms_key_id,
+            filters,
         })
+    }
+
+    fn with_keys(&self, source_key: String, dest_key: String, quiet_override: bool) -> Self {
+        let mut cloned = self.clone();
+        cloned.source_key = source_key;
+        cloned.dest_key = dest_key;
+        cloned.quiet = quiet_override;
+        cloned
     }
 
     /// Get the source object's size in bytes.
@@ -195,6 +334,14 @@ impl S3CopyApp {
                 )
             })?;
         Ok(metadata.content_length.unwrap_or(0))
+    }
+
+    /// Get total size of all objects under a prefix (directory mode).
+    /// Lists all objects and sums their sizes.
+    pub async fn get_total_size_from_prefix(&self, prefix: &str) -> Result<i64> {
+        let objects = self.list_objects_with_prefix(prefix).await?;
+        let total_size: i64 = objects.iter().map(|o| o.size).sum();
+        Ok(total_size)
     }
 
     /// Get object metadata
@@ -310,13 +457,13 @@ impl S3CopyApp {
             if let Some(wr) = source_metadata.website_redirect_location() {
                 builder = builder.website_redirect_location(wr);
             }
-            if let Some(ex) = source_metadata.expires_string() {
-                if let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
+            if let Some(ex) = source_metadata.expires_string()
+                && let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
                     ex,
                     aws_smithy_types::date_time::Format::HttpDate,
-                ) {
-                    builder = builder.set_expires(Some(dt));
-                }
+                )
+            {
+                builder = builder.set_expires(Some(dt));
             }
 
             // Copy custom metadata
@@ -330,26 +477,25 @@ impl S3CopyApp {
         }
 
         // Copy tags unless disabled
-        if !self.no_tags {
-            if let Some(tags) = source_tags {
-                if !tags.is_empty() {
-                    let tagging = tags
-                        .into_iter()
-                        .map(|t| format!("{}={}", t.key(), t.value()))
-                        .collect::<Vec<_>>()
-                        .join("&");
-                    builder = builder.tagging(tagging);
-                }
-            }
+        if !self.no_tags
+            && let Some(tags) = source_tags
+            && !tags.is_empty()
+        {
+            let tagging = tags
+                .into_iter()
+                .map(|t| format!("{}={}", t.key(), t.value()))
+                .collect::<Vec<_>>()
+                .join("&");
+            builder = builder.tagging(tagging);
         }
 
         // Set storage class
         if let Some(sc) = &self.storage_class {
             builder = builder.storage_class(sc.clone());
-        } else if !self.no_storage_class {
-            if let Some(sc) = source_metadata.storage_class() {
-                builder = builder.storage_class(sc.clone());
-            }
+        } else if !self.no_storage_class
+            && let Some(sc) = source_metadata.storage_class()
+        {
+            builder = builder.storage_class(sc.clone());
         }
 
         // Set ACL unless disabled
@@ -604,6 +750,234 @@ impl S3CopyApp {
         }
     }
 
+    /// Copy objects from a source prefix (directory path)
+    pub async fn copy_from_prefix(&self, source_prefix: &str, dest_prefix: &str) -> Result<()> {
+        let normalized_source = normalize_prefix(source_prefix);
+        let normalized_dest = normalize_prefix(dest_prefix);
+        let objects = self.list_objects_with_prefix(&normalized_source).await?;
+
+        if objects.is_empty() {
+            println!(
+                "No objects found at s3://{}/{}",
+                self.source_bucket, normalized_source
+            );
+            return Ok(());
+        }
+
+        let total_bytes: i64 = objects.iter().map(|o| o.size).sum();
+        let total_objects = objects.len();
+        let pace_delay = object_pace_delay(total_objects);
+        let retry_limit: usize = if total_objects >= 10_000 {
+            7
+        } else if total_objects >= 2_000 {
+            6
+        } else {
+            4
+        };
+        let report_interval = progress_report_interval(total_objects);
+        let started = Instant::now();
+
+        if !self.quiet {
+            println!(
+                "Found {} objects ({} bytes) to copy",
+                total_objects, total_bytes
+            );
+            println!(
+                "Prefix copy tuning: retries={}, pacing={}ms/report-every={} objects",
+                retry_limit,
+                pace_delay.as_millis(),
+                report_interval
+            );
+        }
+
+        let mut processed = 0usize;
+        let mut copied = 0usize;
+        let mut failed = 0usize;
+        let mut retried = 0usize;
+        let mut bytes_copied: i64 = 0;
+        let mut bytes_processed: i64 = 0;
+        let mut error_samples: Vec<String> = Vec::new();
+
+        for (idx, obj) in objects.iter().enumerate() {
+            let dest_key = dest_key_from_prefix(&normalized_source, &normalized_dest, &obj.key);
+            let quiet_for_object = self.quiet || total_objects > 1;
+
+            if !self.quiet {
+                println!(
+                    "\n[{:>5}/{:>5}] {} -> {} ({} bytes)",
+                    idx + 1,
+                    total_objects,
+                    obj.key,
+                    dest_key,
+                    obj.size
+                );
+            }
+
+            let per_file_app = self.with_keys(obj.key.clone(), dest_key.clone(), quiet_for_object);
+            let mut attempt = 1usize;
+            let mut succeeded = false;
+
+            loop {
+                match per_file_app.copy_file().await {
+                    Ok(_) => {
+                        copied += 1;
+                        bytes_copied += obj.size;
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let retryable = is_retryable_prefix_error(&e);
+                        if retryable && attempt < retry_limit {
+                            retried += 1;
+                            let delay = retry_backoff_delay(attempt, total_objects);
+                            if !self.quiet {
+                                eprintln!(
+                                    "  ⚠️ Retryable error (attempt {}/{}): {}. Backing off {}ms",
+                                    attempt,
+                                    retry_limit,
+                                    e,
+                                    delay.as_millis()
+                                );
+                            }
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        failed += 1;
+                        if error_samples.len() < 5 {
+                            error_samples.push(format!("{} -> {}: {}", obj.key, dest_key, e));
+                        }
+                        eprintln!("  ❌ Failed: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            processed += 1;
+            bytes_processed += obj.size;
+
+            if !self.quiet {
+                let should_report = !succeeded
+                    || processed.is_multiple_of(report_interval)
+                    || processed == total_objects;
+                if should_report {
+                    let elapsed = started.elapsed();
+                    let file_pct = (processed as f64 / total_objects as f64) * 100.0;
+                    let byte_pct = if total_bytes <= 0 {
+                        100.0
+                    } else {
+                        (bytes_processed as f64 / total_bytes as f64) * 100.0
+                    };
+                    let throughput_mib = if elapsed.as_secs_f64() > 0.0 {
+                        (bytes_processed as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    let eta = eta_from_progress(elapsed, bytes_processed, total_bytes)
+                        .map(|d| format!("{}s", d.as_secs()))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    println!(
+                        "  Progress: files {}/{} ({:.1}%), bytes {} / {} ({:.1}%), copied={}, failed={}, retried={}, elapsed={}s, throughput={:.2} MiB/s, eta={}",
+                        processed,
+                        total_objects,
+                        file_pct,
+                        bytes_processed,
+                        total_bytes,
+                        byte_pct,
+                        copied,
+                        failed,
+                        retried,
+                        elapsed.as_secs(),
+                        throughput_mib,
+                        eta
+                    );
+                }
+            }
+
+            if pace_delay > Duration::from_millis(0) && idx + 1 < total_objects {
+                tokio::time::sleep(pace_delay).await;
+            }
+        }
+
+        if !self.quiet {
+            let elapsed = started.elapsed();
+            let avg_mib_s = if elapsed.as_secs_f64() > 0.0 {
+                (bytes_processed as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            println!("\n=== Summary ===");
+            println!("Total:   {}", total_objects);
+            println!("Done:    {}", processed);
+            println!("Copied:  {}", copied);
+            println!("Failed:  {}", failed);
+            println!("Retried: {}", retried);
+            println!("Bytes copied:    {} / {}", bytes_copied, total_bytes);
+            println!("Bytes processed: {} / {}", bytes_processed, total_bytes);
+            println!("Elapsed: {}s", elapsed.as_secs());
+            println!("Avg throughput: {:.2} MiB/s", avg_mib_s);
+            for sample in &error_samples {
+                println!("Error sample: {}", sample);
+            }
+        }
+
+        if failed > 0 {
+            Err(anyhow::anyhow!("{} objects failed to copy", failed))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// List all objects under a given prefix (public for estimation use)
+    pub async fn list_objects_with_prefix(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let filters = self.filters.as_ref();
+        let mut objects = Vec::new();
+        let listing_prefix = normalize_prefix(prefix);
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .source_client
+                .list_objects_v2()
+                .bucket(&self.source_bucket)
+                .prefix(&listing_prefix);
+
+            if let Some(token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let response = req.send().await?;
+
+            for obj in response.contents() {
+                if let Some(key) = obj.key() {
+                    let key_string = key.to_string();
+                    if let Some(f) = filters
+                        && !f.matches(&key_string)
+                    {
+                        continue;
+                    }
+                    let size = obj.size().unwrap_or(0);
+                    objects.push(ListedObject {
+                        key: key_string,
+                        size,
+                    });
+                }
+            }
+
+            let is_truncated = response.is_truncated();
+            if is_truncated.unwrap_or(false) {
+                continuation_token = response
+                    .clone()
+                    .next_continuation_token()
+                    .map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(objects)
+    }
+
     /// Copy the file using multipart upload
     pub async fn copy_file(&self) -> Result<()> {
         if !self.quiet {
@@ -756,23 +1130,23 @@ impl S3CopyApp {
                         if let Some(wr) = metadata.website_redirect_location() {
                             builder = builder.website_redirect_location(wr);
                         }
-                        if let Some(ex) = metadata.expires_string() {
-                            if let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
+                        if let Some(ex) = metadata.expires_string()
+                            && let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
                                 ex,
                                 aws_smithy_types::date_time::Format::HttpDate,
-                            ) {
-                                builder = builder.set_expires(Some(dt));
-                            }
+                            )
+                        {
+                            builder = builder.set_expires(Some(dt));
                         }
                     }
 
                     // Re-apply custom metadata unless disabled (preserving our source-etag)
-                    if !self.no_metadata {
-                        if let Some(m) = metadata.metadata() {
-                            for (k, v) in m {
-                                if k != "source-etag" {
-                                    builder = builder.metadata(k, v);
-                                }
+                    if !self.no_metadata
+                        && let Some(m) = metadata.metadata()
+                    {
+                        for (k, v) in m {
+                            if k != "source-etag" {
+                                builder = builder.metadata(k, v);
                             }
                         }
                     }
@@ -782,24 +1156,25 @@ impl S3CopyApp {
                     // Re-apply storage class unless disabled
                     if let Some(sc) = &self.storage_class {
                         builder = builder.storage_class(sc.clone());
-                    } else if !self.no_storage_class {
-                        if let Some(sc) = metadata.storage_class() {
-                            builder = builder.storage_class(sc.clone());
-                        }
+                    } else if !self.no_storage_class
+                        && let Some(sc) = metadata.storage_class()
+                    {
+                        builder = builder.storage_class(sc.clone());
                     }
 
                     // Sync tags if needed and not disabled
-                    if !self.no_tags && !tags_match {
-                        if let Some(tags) = &source_tags {
-                            let tagging = tags
-                                .iter()
-                                .map(|t| format!("{}={}", t.key(), t.value()))
-                                .collect::<Vec<_>>()
-                                .join("&");
-                            builder = builder.tagging(tagging);
-                            builder = builder
-                                .tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace);
-                        }
+                    if !self.no_tags
+                        && !tags_match
+                        && let Some(tags) = &source_tags
+                    {
+                        let tagging = tags
+                            .iter()
+                            .map(|t| format!("{}={}", t.key(), t.value()))
+                            .collect::<Vec<_>>()
+                            .join("&");
+                        builder = builder.tagging(tagging);
+                        builder =
+                            builder.tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace);
                     }
 
                     if self.dry_run {
@@ -932,13 +1307,13 @@ impl S3CopyApp {
                 if let Some(wr) = metadata.website_redirect_location() {
                     builder = builder.website_redirect_location(wr);
                 }
-                if let Some(ex) = metadata.expires_string() {
-                    if let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
+                if let Some(ex) = metadata.expires_string()
+                    && let Ok(dt) = aws_smithy_types::date_time::DateTime::from_str(
                         ex,
                         aws_smithy_types::date_time::Format::HttpDate,
-                    ) {
-                        builder = builder.set_expires(Some(dt));
-                    }
+                    )
+                {
+                    builder = builder.set_expires(Some(dt));
                 }
 
                 // Re-apply custom metadata (preserving our source-etag)
@@ -956,26 +1331,24 @@ impl S3CopyApp {
             // Apply storage class
             if let Some(sc) = &self.storage_class {
                 builder = builder.storage_class(sc.clone());
-            } else if !self.no_storage_class {
-                if let Some(sc) = metadata.storage_class() {
-                    builder = builder.storage_class(sc.clone());
-                }
+            } else if !self.no_storage_class
+                && let Some(sc) = metadata.storage_class()
+            {
+                builder = builder.storage_class(sc.clone());
             }
 
             // Apply tags
-            if !self.no_tags {
-                if let Some(tags) = &source_tags {
-                    if !tags.is_empty() {
-                        let tagging = tags
-                            .iter()
-                            .map(|t| format!("{}={}", t.key(), t.value()))
-                            .collect::<Vec<_>>()
-                            .join("&");
-                        builder = builder.tagging(tagging);
-                        builder =
-                            builder.tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace);
-                    }
-                }
+            if !self.no_tags
+                && let Some(tags) = &source_tags
+                && !tags.is_empty()
+            {
+                let tagging = tags
+                    .iter()
+                    .map(|t| format!("{}={}", t.key(), t.value()))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                builder = builder.tagging(tagging);
+                builder = builder.tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace);
             }
 
             if self.dry_run {
@@ -1276,7 +1649,11 @@ impl S3CopyApp {
                 }
                 VerifyIntegrity::Checksum => {
                     let provider = HeadObjectChecksumProvider;
-                    Self::verify_checksum_with_provider(&provider, &source_metadata, &dest_metadata)?;
+                    Self::verify_checksum_with_provider(
+                        &provider,
+                        &source_metadata,
+                        &dest_metadata,
+                    )?;
                 }
             }
 
@@ -1334,6 +1711,7 @@ mod tests {
             checksum_algorithm: None,
             sse: None,
             sse_kms_key_id: None,
+            filters: None,
         }
     }
 
@@ -1444,8 +1822,178 @@ mod tests {
 
         let err = S3CopyApp::verify_checksum_with_provider(&mock, &src_meta, &dst_meta)
             .expect_err("missing checksums must fail");
-        assert!(err
-            .to_string()
-            .contains("Checksum verification requested but checksum headers are not available"));
+        assert!(
+            err.to_string()
+                .contains("Checksum verification requested but checksum headers are not available")
+        );
     }
+
+    #[test]
+    fn include_and_exclude_filters_apply() {
+        let filter =
+            KeyFilter::from_patterns(vec!["*.parquet".to_string()], vec!["logs/*".to_string()])
+                .expect("filter creation failed")
+                .expect("filters should be present");
+
+        assert!(filter.matches("dataset/file.parquet"));
+        assert!(!filter.matches("dataset/file.csv"));
+        assert!(!filter.matches("logs/file.parquet"));
+    }
+
+    #[test]
+    fn dest_key_mapping_preserves_structure() {
+        let normalized_source = normalize_prefix("dataset/raw");
+        let normalized_dest = normalize_prefix("backup");
+        let dest_key = dest_key_from_prefix(
+            &normalized_source,
+            &normalized_dest,
+            "dataset/raw/2026/part-000.parquet",
+        );
+        assert_eq!(dest_key, "backup/2026/part-000.parquet");
+    }
+
+    #[test]
+    fn retryable_error_classifier_handles_s3_pressure_signals() {
+        let slowdown = anyhow::anyhow!("SlowDown: Please reduce your request rate.");
+        let throttling = anyhow::anyhow!("ThrottlingException");
+        let not_retryable = anyhow::anyhow!("AccessDenied");
+
+        assert!(is_retryable_prefix_error(&slowdown));
+        assert!(is_retryable_prefix_error(&throttling));
+        assert!(!is_retryable_prefix_error(&not_retryable));
+    }
+
+    #[test]
+    fn backoff_and_pacing_scale_with_object_count() {
+        let small = retry_backoff_delay(1, 500);
+        let large = retry_backoff_delay(1, 20_000);
+        let later_attempt = retry_backoff_delay(4, 20_000);
+        let tiny_pace = object_pace_delay(100);
+        let big_pace = object_pace_delay(60_000);
+
+        assert!(large > small);
+        assert!(later_attempt > large);
+        assert_eq!(tiny_pace.as_millis(), 0);
+        assert!(big_pace.as_millis() > 0);
+    }
+
+    #[test]
+    fn eta_is_none_without_meaningful_progress() {
+        let elapsed = Duration::from_secs(10);
+        assert!(eta_from_progress(elapsed, 0, 1024).is_none());
+        assert!(eta_from_progress(elapsed, 1024, 1024).is_none());
+        assert!(eta_from_progress(elapsed, 512, 1024).is_some());
+    }
+
+    // /// List objects in a bucket with the given prefix (recursive/flat).
+    // async fn list_objects(&self, bucket: &str, key_prefix: Option<&str>) -> Result<Vec<String>> {
+    //     let paginator = aws_sdk_s3::client::paginator::PaginatorBuilder::new()
+    //         .client(&self.source_client)
+    //         .with_list_objects_v2(
+    //             self.source_client.list_objects_v2()
+    //                 .bucket(bucket)
+    //                 .prefix(key_prefix.map(|p| format!("{}/", p))
+    //                     .unwrap_or_else(|| "*/".to_string())), // Use "*" for all objects if no prefix
+    //         )
+    //         .build()?;
+
+    //     let mut keys = Vec::new();
+
+    //     while let Some(response) = paginator.next().await {
+    //         if let Some(contents) = response.contents() {
+    //             for obj in contents {
+    //                 let key = obj.key().map(|k| k.as_str()).unwrap_or_default();
+    //                 // Skip common S3 system folders (e.g., .version2, .data or hidden objects like _object)
+    //                 if key.starts_with('.') || key.starts_with('_') {
+    //                     continue;
+    //                 }
+    //                 // Skip bucket ARN prefix which may appear as object names with "/" in name
+    //                 if !key.contains('/') && !is_bucket_arn(prefix_or_key(&obj.key())) {
+    //                     keys.push(key.trim_matches('/'));
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     Ok(keys)
+    // }
+
+    // /// Check if a string might be an S3 bucket ARN (e.g. "arn:aws:s3:::mybucket")
+    // fn is_bucket_arn(key: &str) -> bool {
+    //     key.starts_with("arn:aws:s3:::") || key == "/"
+    // }
+
+    // /// Get a prefix by path string
+    // fn prefix_from_path(path: &str) -> String {
+    //     path.trim_end_matches(char::is_whitespace).trim_start_matches('/').to_string()
+    // }
+
+    // /// Copy multiple files based on source prefix (directory mode).
+    // pub async fn copy_directory(&self, bucket: Option<&str>, key_prefix: Option<&str>) -> Result<()> {
+    //     if let Some(ref src_bucket) = bucket {
+    //         let keys = self.list_objects(src_bucket, &None::<&String>).await?;
+    //         let mut files_to_copy: Vec<(String, String)> = Vec::new();
+
+    //         // Remove duplicates and sort by size (descending) for optimal ordering
+    //         let mut seen = std::collections::HashSet::new();
+    //         for key in keys {
+    //             if !seen.contains(&key.split('/').next().map(|x| x.to_string()).unwrap_or(key.clone())) {
+    //                 let source_path_key = self.construct_full_path(src_bucket, &Some(&format!("{}{}", src_bucket.as_deref(), key)));
+    //                 files_to_copy.push((source_path_key.clone(), dest_key_from_source_path(&key)));
+    //             }
+    //         }
+
+    //         // Sort by name length to ensure long filenames are processed first
+    //         files_to_copy.sort_by(|a, b| a.2.cmp(&b.2));
+
+    //         let total = files_to_copy.len();
+    //         let start_time = Instant::now();
+
+    //         if *total > 1 {
+    //             // Copy in batches
+    //             for (i, (_src_key, _dst_key)) in files_to_copy.into_iter().enumerate() {
+    //                 println!("Copying file {}:{}", i + 1, total);
+    //                 let src_bucket = Some(self.source_bucket.clone());
+    //                 let src_key = files_to_copy[i].clone();
+    //                 // ...copy logic...
+    //             }
+    //         } else if !self.quiet {
+    //             println!("✅ No files to copy");
+    //         }
+
+    //         Ok(())
+    //     } else {
+    //         Err(anyhow::anyhow!("No directory prefix provided. Use --source-prefix to specify a source directory prefix."))
+    //     }
+    // }
+
+    // /// Construct full key from bucket and relative path
+    // fn construct_full_path(&self, bucket: &str, path: &Option<&String>) -> String {
+    //     match path {
+    //         Some(prefix) => format!("{}/{}", bucket.trim_end_matches('/'), prefix),
+    //         None => bucket.to_string(),
+    //     }
+    // }
+
+    // /// Construct destination key from source path
+    // fn dest_key_from_source_path(source_key: &str) -> String {
+    //     let mut parts = source_key.split('/');
+
+    //     // Handle special cases first
+    //     if source_key == "*" || source_key.trim() == "/" {
+    //         return "copy".to_string();
+    //     }
+
+    //     for part in parts {
+    //         if !part.is_empty() {
+    //             match &mut parts[0] {
+    //                 ref mut s3_bucket => *s3_bucket = format!("{}-{}", s3_bucket.as_ref(), part),
+    //                 _ => {}
+    //             }
+    //         }
+    //     }
+
+    //     // Remove trailing slash
+    //     format!("{}/", parts.0)
+    // }
 }

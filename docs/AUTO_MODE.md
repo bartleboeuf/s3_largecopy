@@ -60,6 +60,8 @@ Cost behavior also depends on profile:
 
 `--estimate` uses the same auto-policy logic (instant copy decision, part sizing, multipart count) so predicted strategy stays consistent with runtime behavior.
 
+When AWS pricing access is available, `--estimate` also queries live S3 rates through the `s3-pricing` crate. If pricing lookup fails, the command falls back to the built-in regional pricing table so estimation still works offline or with limited IAM permissions.
+
 ## Decision Flow Diagram
 
 ```mermaid

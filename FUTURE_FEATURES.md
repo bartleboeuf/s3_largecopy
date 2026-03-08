@@ -1,40 +1,29 @@
 # Future Features
 
-## Recursive Synchronization
-The current tool works file-to-file. The most high-impact feature would be implementing directory syncing similar to aws s3 sync.
-
-How it works: Iterate through a source prefix, list objects, and map them to the destination.
-Why: It turns the tool from a "large file copier" into a "large dataset migration tool."
-Implementation: I would need to add list_objects_v2 logic and loop the existing 
-copy_file logic over the results.
-
-## Advanced Filtering (Include/Exclude)
-If I implement recursive syncing, users will need to filter what gets copied.
-
-Feature: Add --include "*.iso" or --exclude "*.tmp" flags.
-Implementation: Simple glob pattern matching on keys before initiating the copy.
-
 ## Cross-Region optimizations
-Optimizing the transfer between regions is critical for performance.
+Optimize the transfer between regions beyond the generic autopilot settings.
 
-How it works: Use S3 Transfer Acceleration for supported transfer paths.
-Why: S3 Transfer Acceleration can improve transfer speed for long-distance paths, but it adds acceleration charges and should be optional based on cost/performance needs.
-Implementation: Add a --transfer-acceleration flag.
+How it works: Automatically detect when S3 Transfer Acceleration or multi-threaded routes would reduce latency and surface the cost tradeoff to the user.
+Why: Cross-region copies still spend most of their cost on long-haul transfers, so highlighting transfer acceleration per region gives teams a predictable knob for performance.
+Implementation: Add a `--transfer-acceleration` flag, surface the estimated acceleration surcharge in the `--estimate` output, and optionally recommend it when latency is the bottleneck.
 
 ## Cross-Partition support
-Offer a simple way to copy between AWS partitions.
+Offer a simple way to copy between AWS partitions (consumer/standard, govcloud, china).
 
-Feature: Add --partition-source and --partition-dest flags.
-Why: AWS partitions are different regions, but they are not accessible from each other.
+Feature: Add `--partition-source` and `--partition-dest` flags plus built-in credential chaining for partition-specific endpoints.
+Why: Customers moving data into GovCloud or the China partition currently have to script around different endpoints and credentials.
+Implementation: Introduce partition-aware clients, and keep the CLI options minimal by tying the partition flags to the detected bucket region when possible.
 
-## Add a progress bar for the overall transfer
+## Transfer validation and sync audits
+Add post-copy validation to ensure the destination data matches the source metadata.
 
-Feature: Add a progress bar for the overall transfer.
-Why: It is useful to see the progress of the transfer.
-Implementation: Add a progress bar for the overall transfer.
+Feature: `--verify-esit` (existence + size + optional checksum) that runs in parallel after copy completion.
+Why: Heavy-duty migrations require proof that nothing was missed and no silent failures occurred.
+Implementation: Reuse the existing metadata/tag copying logic and extend `--estimate` to project validation time so users can plan their window.
 
-## Enhance errors messages
+## Observable telemetry hooks
+Expose hooks for integration with dashboards, so the tool can track throughput or cost trends.
 
-Feature: Show clear error messages and not the exceptions from the API or the rust language.
-Why: Current messages are now really understandable to most of the users.
-Implementation: Make some human readable messages based on error patterns. For some, like SCP errors, give some advice in the message.
+Feature: Emit structured JSON progress events (file name, bytes transferred, errors) to a socket or file path.
+Why: Teams running bulk migrations often want to feed progress into CloudWatch, Splunk, or their own dashboards.
+Implementation: Add `--progress-sink` (path or unix socket) that writes newline-delimited JSON events alongside the existing human-friendly UI.

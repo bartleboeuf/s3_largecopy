@@ -1,30 +1,20 @@
 use clap::ValueEnum;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum AutoProfile {
+    #[default]
     Balanced,
     Aggressive,
     Conservative,
     CostEfficient,
 }
 
-impl Default for AutoProfile {
-    fn default() -> Self {
-        Self::Balanced
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum VerifyIntegrity {
     Off,
+    #[default]
     Etag,
     Checksum,
-}
-
-impl Default for VerifyIntegrity {
-    fn default() -> Self {
-        Self::Etag
-    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -189,8 +179,7 @@ pub fn optimize_part_size_for_cost(
     };
 
     let cost_floor = ((file_size_bytes + target_max_parts - 1) / target_max_parts)
-        .max(S3_MIN_PART_SIZE)
-        .min(S3_MAX_PART_SIZE);
+        .clamp(S3_MIN_PART_SIZE, S3_MAX_PART_SIZE);
     let cost_floor_mib = ((cost_floor + MIB - 1) / MIB) * MIB;
 
     candidate_part_size

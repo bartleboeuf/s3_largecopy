@@ -79,7 +79,7 @@ graph TD
     end
 
     subgraph Service Layer
-        Pricing[pricing.rs - AWS Pricing API]
+        Pricing[s3-pricing crate - AWS Pricing API]
         S3Utils[s3_utils.rs - Bucket Detection]
         Estimate[estimate.rs - Cost Orchestration]
     end
@@ -99,7 +99,7 @@ graph TD
 ### Module Descriptions
 - **`app.rs`**: The primary state machine. Coordinates the multipart upload lifecycle.
 - **`auto.rs`**: The "brain" of the tool. Calculates part sizes, throughput-based adjustments, and adaptive concurrency.
-- **`pricing.rs`**: Fetches real-time cost data from the AWS Price List API.
+- **`s3-pricing` crate**: External dependency that fetches real-time cost data from the AWS Price List API.
 - **`estimate.rs`**: Logic for dry-run cost projections.
 - **`progress.rs`**: Handles the terminal UI and throughput statistics.
 

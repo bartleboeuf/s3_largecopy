@@ -1,12 +1,14 @@
 # S3 Copy Cost Analysis
 
-This document provides a cost breakdown for copying large datasets using the optimized `s3_largecopy` tool. You can use the built-in pricing tool to see live data for your specific configuration.
+This document provides a cost breakdown for copying large datasets using the optimized `s3_largecopy` tool. You can use the built-in pricing tool, backed by the `s3-pricing` crate, to see live data for your specific configuration.
 
 ## Check Live Pricing
 Run the following command to get current pricing for any region and storage class:
 ```bash
 s3_largecopy --get-price --region us-east-1 --storage-class STANDARD
 ```
+
+For dry-run planning, `--estimate` uses the same live pricing path when `pricing:GetProducts` is allowed and falls back to bundled regional defaults otherwise.
 
 ## Scenario
 - **Total Data**: 1 TB (10 files of 100 GB each)
@@ -55,4 +57,4 @@ By using a **256 MB** part size instead of the minimum **5 MB**:
 
 ---
 
-*Generated on: 2026-02-07*
+*Reference example refreshed on: 2026-03-08*

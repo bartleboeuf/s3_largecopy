@@ -52,11 +52,33 @@ Enable additional checksum validation (CRC32, CRC32C, SHA1, or SHA256) during tr
 ```
 
 ### Cost Estimation
-Get a precise cost breakdown before running the actual copy.
+Get a cost breakdown before running the actual copy. The command uses live S3 pricing through the `s3-pricing` crate when available, then falls back to bundled regional defaults if pricing lookup is unavailable.
 
 ```bash
 ./s3_largecopy -s src -k file -b dst -t file --estimate
 ```
+
+### Live Pricing Lookup
+Print current S3 storage, request, and transfer pricing for a region and storage class.
+
+```bash
+./s3_largecopy --get-price --region us-east-1 --storage-class STANDARD
+```
+
+### Recursive Prefix Mode
+Copy entire prefixes and optionally filter keys with include/exclude globs.
+
+```bash
+./s3_largecopy \
+  --source-bucket dataset \
+  --source-prefix raw/2025/ \
+  --dest-bucket analytics \
+  --dest-prefix archived/2025/ \
+  --include "*.parquet" \
+  --exclude "_tmp/*"
+```
+
+Patterns run against the key names under the source prefix (e.g., `--include "*.parquet"` keeps only Parquet objects, `--exclude "_tmp/*"` skips temporary folders).
 
 ## Command Line Reference
 
@@ -73,6 +95,10 @@ Get a precise cost breakdown before running the actual copy.
 | `--storage-class` |  | Target storage class | Source/default |
 | `--auto` | | Enable automatic transfer tuning | `false` |
 | `--auto-profile` | | Tuning profile (`balanced`, `aggressive`, `cost-efficient`) | `balanced` |
+| `--source-prefix` | | Source prefix for recursive copy | None |
+| `--dest-prefix` | | Destination prefix for recursive copy | None |
+| `--include` | | Include glob(s) when copying a prefix | None |
+| `--exclude` | | Exclude glob(s) when copying a prefix | None |
 | `--dry-run` | | Simulate copy without modifying data | `false` |
 | `--estimate` | | Print cost estimate and exit | `false` |
 | `--force-copy` | | Always overwrite destination | `false` |

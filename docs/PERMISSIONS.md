@@ -22,7 +22,11 @@ This document lists the AWS permissions required to run the S3 Large File Copy T
 
 ### Pricing API (Optional)
 Required only if using `--estimate` or `--get-price`:
-- `pricing:GetProducts`: Fetch real-time S3 pricing data.
+- `pricing:GetProducts`: Fetch real-time S3 pricing data through the `s3-pricing` crate.
+
+If this permission is missing:
+- `--get-price` fails because it depends entirely on live pricing lookups.
+- `--estimate` still works, but it falls back to the built-in regional pricing table.
 
 ## IAM Policy Example
 

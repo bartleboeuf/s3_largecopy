@@ -14,17 +14,33 @@ It is satisfying to see that the transfer of a single 100 GB file takes less tha
 ## Key Features
 
 - **🚀 Performance**: High-concurrency multipart engine with adaptive tuning.
-- **💰 Cost Aware**: Real-time cost estimation and request optimization.
+- **💰 Cost Aware**: Live S3 pricing via the `s3-pricing` crate, with fallback regional estimates when the Pricing API is unavailable.
 - **🛠️ Flexible**: Support for all storage classes, KMS encryption, and property preservation.
 - **✅ Reliable**: Automatic cleanup on failure and checksum-based integrity verification.
 - **🚄 Auto-Mode**: Intelligent optimization of part sizes and thread counts.
+- **📁 Recursive Sync**: Copy entire prefixes with include/exclude glob filters.
 
 ## Quick Start
 
 ```bash
 # Basic copy
 ./s3_largecopy -s source-bucket -k data.iso -b dest-bucket -t data.iso
+
+# Recursive prefix sync with filters
+./s3_largecopy --source-bucket source-bucket \
+  --source-prefix dataset/raw/ \
+  --dest-bucket dest-bucket \
+  --dest-prefix backups/raw/ \
+  --include "*.parquet" --exclude ".git/*"
+
+# Live pricing lookup
+./s3_largecopy --get-price --region us-east-1 --storage-class STANDARD
+
+# Cost estimate before copy
+./s3_largecopy -s source-bucket -k data.iso -b dest-bucket -t data.iso --estimate
 ```
+
+`--get-price` depends on live AWS Pricing API access. `--estimate` uses the same live pricing path when available and falls back to bundled regional pricing data if the lookup cannot be completed.
 
 ## Documentation
 
@@ -34,7 +50,7 @@ Detailed documentation is available in the `docs/` directory:
 - [**Usage & Examples**](./docs/USAGE.md) - Basic commands, advanced features, and CLI reference.
 - [**Architecture**](./docs/ARCHITECTURE.md) - How the engine works, diagrams, and internal modules.
 - [**Auto Mode**](./docs/AUTO_MODE.md) - Deep dive into adaptive tuning and profiles.
-- [**Cost Analysis**](./docs/COST_ANALYSIS.md) - Comprehensive guide to S3 transfer costs and estimation logic.
+- [**Cost Analysis**](./docs/COST_ANALYSIS.md) - Comprehensive guide to S3 transfer costs, live pricing, and estimation logic.
 - [**Permissions**](./docs/PERMISSIONS.md) - IAM policy requirements and security configuration.
 - [**Troubleshooting**](./docs/TROUBLESHOOTING.md) - Performance tips and common error resolutions.
 - [**Changelog**](./CHANGELOG.md) - Detailed history of changes and releases.

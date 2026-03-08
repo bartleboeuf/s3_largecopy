@@ -55,6 +55,8 @@ cargo build --release
 # The binary will be at target/release/s3_largecopy
 ```
 
+The pricing commands (`--get-price` and the live-pricing path inside `--estimate`) are compiled in through the `s3-pricing` crate. No extra build step is required beyond valid AWS credentials at runtime.
+
 ### Static Binary Build (Recommended for Portability)
 Static binaries include all necessary libraries (via `musl-libc`) and work on any Linux server regardless of the local GLIBC version.
 
